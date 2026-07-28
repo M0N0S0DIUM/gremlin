@@ -254,7 +254,7 @@ fn handle_service(action: ServiceAction) -> Result<(), GremlinError> {
 
             std::fs::create_dir_all(&service_dir)?;
 
-            let service_content = include_str!("../../config/gremlin.service").to_string();
+            let service_content = include_str!("../config/gremlin.service").to_string();
             let home = dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("/home/user"));
             let service_content = service_content.replace(
