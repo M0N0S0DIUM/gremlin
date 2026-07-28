@@ -313,6 +313,54 @@ impl ToolRegistry {
             Box::new(|_args| shell::last_exit_code()),
         );
 
+        // ── Vision / Screenshot ──
+
+        registry.register(
+            "screenshot",
+            "Capture a screenshot and describe what's on screen using the vision model. \
+             Useful when the user asks 'what do you see?' or 'look at this error'.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "What to look for in the screenshot (e.g. 'Describe the error on screen')"
+                    }
+                },
+                "required": []
+            }),
+            Box::new(|args| {
+                let prompt = args.get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Describe what you see on the screen. Focus on code, errors, and UI elements.");
+
+                let image_bytes = crate::vision::capture_screenshot()?;
+
+                let config = crate::config::Config::load()
+                    .map_err(|e| GremlinError::Tool(format!("Config error: {e}")))?;
+
+                let vision_model = config.vision
+                    .as_ref()
+                    .map(|v| v.model.clone())
+                    .unwrap_or_else(|| "llama3.2-vision:11b".to_string());
+
+                let ollama_url = config.ollama.url.clone();
+
+                let handle = tokio::runtime::Handle::current();
+                let description = handle.block_on(crate::vision::describe_screenshot(
+                    &ollama_url,
+                    &vision_model,
+                    &image_bytes,
+                    prompt,
+                ))?;
+
+                Ok(format!(
+                    "Screenshot ({:.1}KB) — {vision_model}:\n{description}",
+                    image_bytes.len() as f64 / 1024.0
+                ))
+            }),
+        );
+
         // ── Hermes coding service ──
 
         registry.register(
@@ -441,5 +489,56 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_has_tools() {
+        let registry = ToolRegistry::new();
+        assert!(registry.tools.len() >= 20, "expected >=20 tools, got {}", registry.tools.len());
+    }
+
+    #[test]
+    fn test_pwd_tool() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("pwd", serde_json::json!({}));
+        assert!(result.success, "pwd failed: {}", result.output);
+    }
+
+    #[test]
+    fn test_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("nope_nope", serde_json::json!({}));
+        assert!(!result.success);
+        assert!(result.output.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn test_all_tools_have_descriptions() {
+        let registry = ToolRegistry::new();
+        for tool in &registry.tools {
+            assert!(!tool.description.is_empty(), "tool '{}' has no description", tool.name);
+        }
+    }
+
+    #[test]
+    fn test_git_branch_handles_no_repo() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("git_branch", serde_json::json!({}));
+        // Either succeeds (in a repo) or fails with git error
+        if !result.success {
+            assert!(result.output.contains("git"), "expected git error, got: {}", result.output);
+        }
+    }
+
+    #[test]
+    fn test_list_dir_works() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("list_dir", serde_json::json!({}));
+        assert!(result.success, "list_dir failed: {}", result.output);
     }
 }

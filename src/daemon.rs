@@ -1,6 +1,6 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
-#[cfg(unix)]
-use tracing::error;
 
 use crate::config::Config;
 use crate::context::Context;
@@ -8,9 +8,11 @@ use crate::error::GremlinError;
 use crate::ollama::{Message, Ollama};
 use crate::tools::{ToolRegistry, ToolResult};
 
-// ── Socket path (platform-aware) ──
+#[cfg(unix)]
+use tracing::error;
 
-/// Get the Unix socket path for the daemon. Unix-only.
+// ── Socket path ──
+
 #[cfg(unix)]
 pub fn socket_path() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -19,6 +21,87 @@ pub fn socket_path() -> std::path::PathBuf {
         let uid = unsafe { libc::getuid() };
         std::path::PathBuf::from(format!("/tmp/gremlin-{uid}.sock"))
     }
+}
+
+// ── Conversation state ──
+
+/// A conversation session — persists between queries in daemon mode.
+/// Single-user: one conversation per daemon. Cleared with `/clear`.
+pub struct Conversation {
+    pub messages: Vec<Message>,
+    pub session_id: String,
+}
+
+impl Conversation {
+    pub fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            session_id: uuid_v4(),
+        }
+    }
+
+    /// Clear the conversation — reset to system prompt only.
+    pub fn clear(&mut self) {
+        // Keep system messages, drop the rest
+        self.messages.retain(|m| m.role == "system");
+        self.session_id = uuid_v4();
+        info!(session = %self.session_id, "Conversation cleared");
+    }
+
+    /// Add a message to the conversation.
+    pub fn push(&mut self, msg: Message) {
+        self.messages.push(msg);
+    }
+
+    /// Trim old messages if the conversation gets too long (keep last ~40 messages).
+    pub fn trim(&mut self) {
+        let system_count = self.messages.iter().filter(|m| m.role == "system").count();
+        let max_total = system_count + 40;
+        if self.messages.len() > max_total {
+            let keep_system: Vec<Message> = self
+                .messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .cloned()
+                .collect();
+            let recent: Vec<Message> = self
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .rev()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            self.messages = keep_system;
+            self.messages.extend(recent);
+            debug!("Conversation trimmed to {} messages", self.messages.len());
+        }
+    }
+
+    /// Get the full message list for the LLM.
+    pub fn messages_for_llm(&self, system_prompt: &str, tools_prompt: &str, context_str: &str) -> Vec<Message> {
+        let mut msgs = vec![
+            Message::system(system_prompt),
+            Message::system(tools_prompt),
+        ];
+        if !context_str.is_empty() {
+            msgs.push(Message::system(context_str));
+        }
+        msgs.extend(self.messages.clone());
+        msgs
+    }
+}
+
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:016x}", t)
 }
 
 // ── Tool call parsing ──
@@ -55,31 +138,48 @@ fn tool_result_to_string(result: &ToolResult) -> String {
     }
 }
 
-// ── Core query loop (cross-platform) ──
+// ── Core query loop ──
 
 /// Run a single query through the tool-use loop.
+/// If `conversation` is provided, maintains conversation history between calls.
 pub async fn query(
     config: &Config,
     ollama: &Ollama,
     tools: &ToolRegistry,
     user_message: &str,
+    mut conversation: Option<&mut Conversation>,
 ) -> Result<String, GremlinError> {
     let model = &config.model.name;
+
+    // Handle /clear command
+    if user_message.trim() == "/clear" {
+        if let Some(conv) = conversation {
+            conv.clear();
+            return Ok("Conversation cleared. What's next?".to_string());
+        }
+        return Ok("(one-shot mode has no conversation to clear)".to_string());
+    }
 
     let context = Context::collect(tools);
     let context_str = context.to_prompt_string();
 
-    let mut messages = vec![
-        Message::system(&config.model.system_prompt),
-        Message::system(&tools.tools_prompt()),
-    ];
-
-    if !context_str.is_empty() {
-        messages.push(Message::system(&context_str));
-    }
+    // Build messages — conversation mode includes history
+    let mut messages = if let Some(ref conv) = conversation {
+        conv.messages_for_llm(&config.model.system_prompt, &tools.tools_prompt(), &context_str)
+    } else {
+        let mut msgs = vec![
+            Message::system(&config.model.system_prompt),
+            Message::system(&tools.tools_prompt()),
+        ];
+        if !context_str.is_empty() {
+            msgs.push(Message::system(&context_str));
+        }
+        msgs
+    };
 
     messages.push(Message::user(user_message));
 
+    // Tool-use loop
     for _iteration in 0..5 {
         let response = ollama
             .chat(
@@ -95,13 +195,29 @@ pub async fn query(
         if let Some((tool_name, args)) = parse_tool_call(&response) {
             info!(tool = %tool_name, "executing tool");
             let result = tools.execute(&tool_name, args);
+            let result_str = tool_result_to_string(&result);
+
+            // In conversation mode, save the exchange
+            if let Some(ref mut conv) = conversation {
+                conv.push(Message::assistant(&response));
+                conv.push(Message::user(&result_str));
+                conv.trim();
+            }
+
             messages.push(Message::assistant(&response));
-            messages.push(Message::user(tool_result_to_string(&result)));
+            messages.push(Message::user(&result_str));
         } else {
+            // Final answer — save to conversation
+            if let Some(ref mut conv) = conversation {
+                conv.push(Message::assistant(&response));
+                conv.trim();
+            }
+
             return Ok(response);
         }
     }
 
+    // Final summary after tool loop exhaustion
     messages.push(Message::user(
         "You've used several tools. Now provide your final answer based on the results above.",
     ));
@@ -114,6 +230,11 @@ pub async fn query(
             Some(config.ollama.context_size),
         )
         .await?;
+
+    if let Some(ref mut conv) = conversation {
+        conv.push(Message::assistant(&final_response));
+        conv.trim();
+    }
 
     Ok(final_response)
 }
@@ -128,7 +249,6 @@ mod unix_daemon {
 
     use super::*;
 
-    /// Start the daemon — listens on a Unix socket for queries.
     pub async fn run(config: Config, ollama: Ollama, tools: ToolRegistry) -> Result<(), GremlinError> {
         let path = socket_path();
 
@@ -142,9 +262,10 @@ mod unix_daemon {
 
         info!("Gremlin daemon listening on {}", path.display());
 
-        let config = std::sync::Arc::new(config);
-        let ollama = std::sync::Arc::new(ollama);
-        let tools = std::sync::Arc::new(tools);
+        let config = Arc::new(config);
+        let ollama = Arc::new(ollama);
+        let tools = Arc::new(tools);
+        let conversation = Arc::new(Mutex::new(Conversation::new()));
 
         loop {
             match listener.accept().await {
@@ -152,9 +273,10 @@ mod unix_daemon {
                     let config = config.clone();
                     let ollama = ollama.clone();
                     let tools = tools.clone();
+                    let conversation = conversation.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle(stream, &config, &ollama, &tools).await {
+                        if let Err(e) = handle(stream, &config, &ollama, &tools, &conversation).await {
                             error!("Connection error: {e}");
                         }
                     });
@@ -171,6 +293,7 @@ mod unix_daemon {
         config: &Config,
         ollama: &Ollama,
         tools: &ToolRegistry,
+        conversation: &Arc<Mutex<Conversation>>,
     ) -> Result<(), GremlinError> {
         let (reader, mut writer) = stream.into_split();
         let mut buf_reader = BufReader::new(reader);
@@ -186,7 +309,10 @@ mod unix_daemon {
 
         info!(message = %message, "daemon query");
 
-        let response = query(config, ollama, tools, &message).await?;
+        // Lock conversation for the duration of this query
+        let mut conv = conversation.lock().await;
+        let response = query(config, ollama, tools, &message, Some(&mut conv)).await?;
+        drop(conv); // Release lock before writing response
 
         let reply = serde_json::json!({"response": response});
         let mut reply_bytes = serde_json::to_vec(&reply)?;
@@ -197,7 +323,6 @@ mod unix_daemon {
         Ok(())
     }
 
-    /// Try to send a query to the running daemon.
     pub async fn send(message: &str) -> Result<String, GremlinError> {
         let path = socket_path();
 
@@ -226,9 +351,8 @@ mod unix_daemon {
     }
 }
 
-// ── Public API (platform-dispatching) ──
+// ── Public API ──
 
-/// Start the daemon. Unix-only; panics with a clear message on other platforms.
 pub async fn run_daemon(config: Config, ollama: Ollama, tools: ToolRegistry) -> Result<(), GremlinError> {
     #[cfg(unix)]
     {
@@ -243,7 +367,6 @@ pub async fn run_daemon(config: Config, ollama: Ollama, tools: ToolRegistry) -> 
     }
 }
 
-/// Send a query to the daemon. Returns Err if daemon isn't running or platform doesn't support it.
 pub async fn send_to_daemon(message: &str) -> Result<String, GremlinError> {
     #[cfg(unix)]
     {

@@ -6,6 +6,7 @@ mod error;
 mod hermes;
 mod ollama;
 mod tools;
+mod vision;
 
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
@@ -185,7 +186,7 @@ async fn ask(message: &str) -> Result<(), GremlinError> {
 
     info!("Asking: {}", message);
 
-    match daemon::query(&config, &ollama, &tools, message).await {
+    match daemon::query(&config, &ollama, &tools, message, None).await {
         Ok(response) => {
             println!("{response}");
         }
