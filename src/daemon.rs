@@ -107,6 +107,7 @@ fn uuid_v4() -> String {
 // ── Tool call parsing ──
 
 fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
+    // Look for ```tool ... ``` blocks
     if let Some(start) = response.find("```tool") {
         let json_start = start + "```tool".len();
         let rest = &response[json_start..];
@@ -120,10 +121,33 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
         }
     }
 
+    // Try pure JSON (whole response)
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response.trim()) {
         if let Some(tool) = parsed["tool"].as_str() {
             let args = parsed.get("args").cloned().unwrap_or(serde_json::json!({}));
             return Some((tool.to_string(), args));
+        }
+    }
+
+    // Try finding JSON object embedded anywhere in the response text
+    // Look for {"tool": pattern
+    if let Some(start) = response.find("{\"tool\"") {
+        let rest = &response[start..];
+        // Find the matching closing brace
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in rest.char_indices() {
+            if c == '{' { depth += 1; }
+            if c == '}' { depth -= 1; if depth == 0 { end = i + 1; break; } }
+        }
+        if end > 0 {
+            let json_str = &rest[..end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(tool) = parsed["tool"].as_str() {
+                    let args = parsed.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    return Some((tool.to_string(), args));
+                }
+            }
         }
     }
 
