@@ -20,6 +20,10 @@ pub struct Config {
     #[serde(default)]
     pub vision: Option<VisionConfig>,
 
+    /// Sprite/animation configuration
+    #[serde(default)]
+    pub sprite: Option<SpriteConfig>,
+
     /// Long-term preferences Gremlin remembers
     #[serde(default)]
     pub preferences: Preferences,
@@ -37,6 +41,12 @@ pub struct ModelConfig {
     /// Temperature for the small model
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+
+    /// How long to keep model loaded in VRAM after last request.
+    /// "0" = unload immediately, "5m" = 5 minutes, "-1" = never unload.
+    /// Uses Ollama's keep_alive parameter.
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: String,
 }
 
 fn default_system_prompt() -> String {
@@ -45,6 +55,10 @@ fn default_system_prompt() -> String {
 
 fn default_temperature() -> f32 {
     0.7
+}
+
+fn default_keep_alive() -> String {
+    "5m".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +70,10 @@ pub struct OllamaConfig {
     /// Max context window for the small model
     #[serde(default = "default_context_size")]
     pub context_size: usize,
+
+    /// Default keep_alive for models (passed to Ollama)
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: String,
 }
 
 fn default_ollama_url() -> String {
@@ -84,6 +102,36 @@ fn default_hermes_path() -> String {
 pub struct VisionConfig {
     /// Vision model name in Ollama
     pub model: String,
+}
+
+/// Sprite/animation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpriteConfig {
+    /// Path to sprite assets directory (relative to project root or absolute)
+    /// Default: "assets/sprites"
+    #[serde(default = "default_sprite_dir")]
+    pub assets_dir: String,
+
+    /// Initial animation state on startup
+    #[serde(default = "default_sprite_state")]
+    pub initial_state: String,
+}
+
+fn default_sprite_dir() -> String {
+    "assets/sprites".to_string()
+}
+
+fn default_sprite_state() -> String {
+    "idle".to_string()
+}
+
+impl Default for SpriteConfig {
+    fn default() -> Self {
+        Self {
+            assets_dir: default_sprite_dir(),
+            initial_state: default_sprite_state(),
+        }
+    }
 }
 
 /// Persistent preferences Gremlin learns over time
@@ -137,13 +185,16 @@ impl Default for Config {
                 name: "llama3.2:3b".to_string(),
                 system_prompt: default_system_prompt(),
                 temperature: default_temperature(),
+                keep_alive: default_keep_alive(),
             },
             ollama: OllamaConfig {
                 url: default_ollama_url(),
                 context_size: default_context_size(),
+                keep_alive: default_keep_alive(),
             },
             hermes: None,
             vision: None,
+            sprite: Some(SpriteConfig::default()),
             preferences: Preferences::default(),
         }
     }

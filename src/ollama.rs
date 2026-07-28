@@ -7,6 +7,7 @@ use crate::error::OllamaError;
 pub struct Ollama {
     client: reqwest::Client,
     base_url: String,
+    default_keep_alive: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -16,6 +17,8 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ModelOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +62,7 @@ impl Ollama {
         Self {
             client: reqwest::Client::new(),
             base_url: config.url.clone(),
+            default_keep_alive: config.keep_alive.clone(),
         }
     }
 
@@ -94,6 +98,7 @@ impl Ollama {
         messages: &[Message],
         temperature: Option<f32>,
         context_size: Option<usize>,
+        keep_alive: Option<String>,
     ) -> Result<String, OllamaError> {
         let request = ChatRequest {
             model: model.to_string(),
@@ -103,6 +108,7 @@ impl Ollama {
                 temperature,
                 num_ctx: context_size,
             }),
+            keep_alive: keep_alive.or_else(|| Some(self.default_keep_alive.clone())),
         };
 
         let resp: ChatResponse = self

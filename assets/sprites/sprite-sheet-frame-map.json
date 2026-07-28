@@ -1,0 +1,22 @@
+{
+  "sheet_file": "sprite-sheet-full.png",
+  "sheet_dimensions": "1920x48",
+  "frame_size": 48,
+  "total_frames": 40,
+  "layout": "horizontal strip, left-to-right, index 0-39",
+  "note": "Frame boundaries were extracted mechanically (density/gap detection) from an AI-generated pose-reference illustration, then mapped to intended pose order below. Cross-check indices against sprite-sheet-full.png / the 3x preview before wiring into animation code -- mechanical extraction can occasionally mis-order or duplicate a pose.",
+  "states": [
+    { "name": "sleep",     "frames": [0, 1],           "fps": 2, "loop_anim": true,  "desc": "curled up sleeping, 2 variations" },
+    { "name": "wake",      "frames": [2, 3, 4],        "fps": 4, "loop_anim": false, "desc": "stretching/waking, 3 variations" },
+    { "name": "idle",      "frames": [5, 6, 7, 8],     "fps": 4, "loop_anim": true,  "desc": "standing idle with blink cycle, 4 variations" },
+    { "name": "think",     "frames": [9, 10, 11, 12],  "fps": 3, "loop_anim": true,  "desc": "looking around / hand near chin, 4 variations" },
+    { "name": "typing",    "frames": [13, 14, 15, 16], "fps": 6, "loop_anim": true,  "desc": "typing at keyboard, 4 variations" },
+    { "name": "walk",      "frames": [17, 18, 19, 20, 21, 22], "fps": 8, "loop_anim": true,  "desc": "walk cycle, 6 variations" },
+    { "name": "coffee",    "frames": [23, 24, 25],     "fps": 3, "loop_anim": true,  "desc": "holding/drinking coffee, 3 variations" },
+    { "name": "error",     "frames": [26, 27, 28],     "fps": 4, "loop_anim": false, "desc": "surprised / error state with ?! above head, 3 variations" },
+    { "name": "yawn",      "frames": [29, 30],         "fps": 3, "loop_anim": false, "desc": "yawning, 2 variations" },
+    { "name": "wave",      "frames": [31, 32, 33],     "fps": 4, "loop_anim": false, "desc": "waving / greeting, 3 variations" },
+    { "name": "celebrate", "frames": [34, 35, 36],     "fps": 6, "loop_anim": false, "desc": "jumping / arms up celebration, 3 variations" },
+    { "name": "sit",       "frames": [37, 38, 39],     "fps": 3, "loop_anim": true,  "desc": "sitting relaxed, 3 variations" }
+  ]
+}

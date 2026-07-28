@@ -211,6 +211,7 @@ pub async fn query(
                 &messages,
                 Some(config.model.temperature),
                 Some(config.ollama.context_size),
+                Some(config.model.keep_alive.clone()),
             )
             .await?;
 
@@ -252,6 +253,7 @@ pub async fn query(
             &messages,
             Some(config.model.temperature),
             Some(config.ollama.context_size),
+            Some(config.model.keep_alive.clone()),
         )
         .await?;
 

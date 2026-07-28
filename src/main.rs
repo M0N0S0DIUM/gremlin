@@ -5,6 +5,7 @@ mod desktop;
 mod error;
 mod hermes;
 mod ollama;
+mod sprite;
 mod tools;
 mod vision;
 
@@ -15,7 +16,9 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::error::GremlinError;
 use crate::ollama::Ollama;
+use crate::sprite::{register_sprite_tools, SpriteSystem};
 use crate::tools::ToolRegistry;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "gremlin", about = "Local-first AI orchestration daemon")]
@@ -153,7 +156,19 @@ async fn check() -> Result<(), GremlinError> {
 async fn run_daemon() -> Result<(), GremlinError> {
     let config = Config::load()?;
     let ollama = Ollama::new(&config.ollama);
-    let tools = ToolRegistry::new();
+    let mut tools = ToolRegistry::new();
+
+    // Initialize sprite system
+    let default_sprite = crate::config::SpriteConfig::default();
+    let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
+    let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
+    let initial_state = &sprite_config.initial_state;
+    let sprite_system = Arc::new(SpriteSystem::new(
+        assets_dir.to_str().unwrap_or("assets/sprites"),
+        initial_state,
+    )?);
+    sprite_system.spawn_ticker();
+    register_sprite_tools(&mut tools, sprite_system);
 
     // Verify Ollama is reachable before starting
     ollama.health_check().await.map_err(|e| {
@@ -182,7 +197,18 @@ async fn ask(message: &str) -> Result<(), GremlinError> {
 
     let config = Config::load()?;
     let ollama = Ollama::new(&config.ollama);
-    let tools = ToolRegistry::new();
+    let mut tools = ToolRegistry::new();
+
+    // Initialize sprite system for one-shot mode too
+    let default_sprite = crate::config::SpriteConfig::default();
+    let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
+    let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
+    let initial_state = &sprite_config.initial_state;
+    let sprite_system = Arc::new(SpriteSystem::new(
+        assets_dir.to_str().unwrap_or("assets/sprites"),
+        initial_state,
+    )?);
+    register_sprite_tools(&mut tools, sprite_system);
 
     info!("Asking: {}", message);
 
