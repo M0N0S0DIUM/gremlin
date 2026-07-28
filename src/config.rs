@@ -77,7 +77,12 @@ pub struct OllamaConfig {
 }
 
 fn default_ollama_url() -> String {
-    "http://localhost:11434".to_string()
+    // Use 127.0.0.1 explicitly, not "localhost" — on hosts with WSL installed,
+    // "localhost" can resolve to ::1 which WSL's relay intercepts and forwards
+    // into a separate (often model-less) Ollama instance inside the WSL VM,
+    // causing intermittent "model not found" errors against the real
+    // Windows-side Ollama on 127.0.0.1.
+    "http://127.0.0.1:11434".to_string()
 }
 
 fn default_context_size() -> usize {

@@ -3,9 +3,8 @@ use image::{GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::error::GremlinError;
@@ -109,7 +108,13 @@ impl SpriteSheet {
     }
 }
 
-/// Animation controller — tracks current state, frame, timing
+/// Animation controller — tracks current state, frame, timing.
+/// All operations here are pure/synchronous (no I/O, no awaits) — protected
+/// by a plain std::sync::Mutex so tool closures (which run on the async
+/// runtime's worker threads but are NOT themselves async fns) can lock it
+/// directly without needing block_on (which panics if called from within
+/// a runtime thread — see Tokio's "Cannot start a runtime from within a
+/// runtime" panic).
 pub struct AnimationController {
     sheet: Arc<SpriteSheet>,
     current_state: String,
@@ -195,6 +200,7 @@ impl AnimationController {
             }
         }
 
+        let state = self.sheet.state(&self.current_state).unwrap();
         let global_idx = state.frames[self.frame_index];
         &self.sheet.frames[global_idx]
     }
@@ -234,9 +240,18 @@ impl AnimationController {
         frame.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png).ok()?;
         Some(BASE64_STANDARD.encode(&buf))
     }
+
+    /// Access to the underlying sheet metadata (for listing states etc.)
+    pub fn sheet(&self) -> &SpriteSheet {
+        &self.sheet
+    }
 }
 
-/// Global sprite system holder
+/// Global sprite system holder.
+/// Uses std::sync::Mutex (not tokio::sync::Mutex) because all controller
+/// operations are synchronous — this lets tool closures (sync fns invoked
+/// from ToolRegistry::execute) lock it directly with zero async ceremony,
+/// and avoids the "block_on inside a runtime" panic entirely.
 pub struct SpriteSystem {
     pub controller: Arc<Mutex<AnimationController>>,
 }
@@ -248,21 +263,31 @@ impl SpriteSystem {
         Ok(Self { controller })
     }
 
-    /// Spawn the animation tick loop (call once at startup)
+    /// Spawn the animation tick loop (call once at startup).
+    /// Uses spawn_blocking + std::thread-style sleep loop since the mutex
+    /// is now a std::sync::Mutex; this keeps a dedicated background thread
+    /// ticking the animation without holding up the tokio runtime.
     pub fn spawn_ticker(self: &Arc<Self>) {
         let controller = self.controller.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60fps tick
+        tokio::task::spawn_blocking(move || {
             loop {
-                interval.tick().await;
-                let mut ctrl = controller.lock().await;
-                ctrl.tick();
+                std::thread::sleep(Duration::from_millis(16)); // ~60fps tick
+                if let Ok(mut ctrl) = controller.lock() {
+                    ctrl.tick();
+                }
             }
         });
     }
 }
 
-/// Register sprite tools in the tool registry
+/// Register sprite tools in the tool registry.
+/// NOTE: these closures are plain sync fns (Box<dyn Fn(...) -> Result<...>>)
+/// invoked synchronously by ToolRegistry::execute — they must NOT use
+/// tokio::runtime::Handle::block_on, since tool execution can happen from
+/// within an async task on the runtime's own worker threads, and block_on
+/// from inside a runtime thread panics ("Cannot start a runtime from
+/// within a runtime"). Because AnimationController uses a std::sync::Mutex
+/// and does no I/O, we can just lock it directly here — no async needed.
 pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_system: Arc<SpriteSystem>) {
     use crate::error::GremlinError;
 
@@ -283,13 +308,10 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             Box::new(move |args| {
                 let state = args["state"].as_str().ok_or_else(|| GremlinError::Tool("missing 'state'".into()))?;
                 let one_shot = args["one_shot"].as_bool().unwrap_or(false);
-                let system = system.clone();
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let mut ctrl = system.controller.lock().await;
-                    ctrl.set_state(state, one_shot)?;
-                    Ok(format!("Sprite state set to '{}' (one_shot={})", state, one_shot))
-                })
+                let mut ctrl = system.controller.lock()
+                    .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
+                ctrl.set_state(state, one_shot)?;
+                Ok(format!("Sprite state set to '{}' (one_shot={})", state, one_shot))
             }),
         );
     }
@@ -302,14 +324,11 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             "Get current sprite animation state and frame info.",
             serde_json::json!({"type": "object", "properties": {}}),
             Box::new(move |_args| {
-                let system = system.clone();
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let ctrl = system.controller.lock().await;
-                    let state = ctrl.current_state();
-                    let frame_idx = ctrl.current_frame_index();
-                    Ok(format!("State: {}, Frame: {}", state, frame_idx))
-                })
+                let ctrl = system.controller.lock()
+                    .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
+                let state = ctrl.current_state();
+                let frame_idx = ctrl.current_frame_index();
+                Ok(format!("State: {}, Frame: {}", state, frame_idx))
             }),
         );
     }
@@ -331,14 +350,11 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             Box::new(move |args| {
                 let state = args["state"].as_str().ok_or_else(|| GremlinError::Tool("missing 'state'".into()))?;
                 let frame = args["frame"].as_u64().ok_or_else(|| GremlinError::Tool("missing 'frame'".into()))? as usize;
-                let system = system.clone();
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let ctrl = system.controller.lock().await;
-                    ctrl.frame_base64(state, frame)
-                        .ok_or_else(|| GremlinError::Tool("invalid state/frame".into()))
-                        .map(|b64| format!("data:image/png;base64,{}", b64))
-                })
+                let ctrl = system.controller.lock()
+                    .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
+                ctrl.frame_base64(state, frame)
+                    .ok_or_else(|| GremlinError::Tool("invalid state/frame".into()))
+                    .map(|b64| format!("data:image/png;base64,{}", b64))
             }),
         );
     }
@@ -351,13 +367,10 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             "Get the current animation frame as base64 PNG for terminal graphics.",
             serde_json::json!({"type": "object", "properties": {}}),
             Box::new(move |_args| {
-                let system = system.clone();
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let ctrl = system.controller.lock().await;
-                    let b64 = ctrl.current_frame_base64();
-                    Ok(format!("data:image/png;base64,{}", b64))
-                })
+                let ctrl = system.controller.lock()
+                    .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
+                let b64 = ctrl.current_frame_base64();
+                Ok(format!("data:image/png;base64,{}", b64))
             }),
         );
     }
@@ -370,17 +383,74 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             "List all available animation states with frame counts and FPS.",
             serde_json::json!({"type": "object", "properties": {}}),
             Box::new(move |_args| {
-                let system = system.clone();
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let ctrl = system.controller.lock().await;
-                    let sheet = &ctrl.sheet;
-                    let lines: Vec<String> = sheet.meta.states.iter().map(|s| {
-                        format!("  {}: {} frames @ {}fps, loop={}, {}", s.name, s.frames.len(), s.fps, s.loop_anim, s.desc)
-                    }).collect();
-                    Ok(format!("Available states:\n{}", lines.join("\n")))
-                })
+                let ctrl = system.controller.lock()
+                    .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
+                let sheet = ctrl.sheet();
+                let lines: Vec<String> = sheet.meta.states.iter().map(|s| {
+                    format!("  {}: {} frames @ {}fps, loop={}, {}", s.name, s.frames.len(), s.fps, s.loop_anim, s.desc)
+                }).collect();
+                Ok(format!("Available states:\n{}", lines.join("\n")))
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sheet_dir() -> std::path::PathBuf {
+        // Repo-relative assets dir used by the daemon at runtime.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/sprites")
+    }
+
+    #[test]
+    fn test_load_sheet_and_states() {
+        let sheet = SpriteSheet::load_from_dir(test_sheet_dir()).expect("sheet should load");
+        assert_eq!(sheet.frames.len(), sheet.meta.total_frames);
+        assert!(sheet.state("idle").is_some(), "expected an 'idle' state");
+    }
+
+    #[test]
+    fn test_set_state_and_tick_dont_panic() {
+        let sheet = Arc::new(SpriteSheet::load_from_dir(test_sheet_dir()).expect("sheet should load"));
+        let mut ctrl = AnimationController::new(sheet, "idle").expect("controller should init");
+        ctrl.set_state("wave", true).expect("wave is a valid state");
+        // Simulate several ticks — must not panic regardless of thread context.
+        for _ in 0..5 {
+            ctrl.tick();
+        }
+        let _ = ctrl.current_frame_base64();
+    }
+
+    /// Regression test for the "Cannot start a runtime from within a runtime"
+    /// panic: tool closures must be able to lock the controller synchronously
+    /// from inside a tokio worker thread (i.e. without block_on). This test
+    /// runs the registered tool closures directly inside a tokio runtime to
+    /// prove they don't rely on block_on/Handle::current, which previously
+    /// caused a panic during real `ask`/`daemon` tool-call loops.
+    #[tokio::test]
+    async fn test_sprite_tools_work_inside_async_runtime() {
+        let system = Arc::new(
+            SpriteSystem::new(test_sheet_dir().to_str().unwrap(), "idle")
+                .expect("sprite system should init"),
+        );
+        let mut registry = crate::tools::ToolRegistry::new();
+        register_sprite_tools(&mut registry, system);
+
+        // Directly exercises sprite_state's closure from within this async
+        // test's tokio runtime context — this is exactly the situation that
+        // previously panicked.
+        let result = registry.execute("sprite_list_states", serde_json::json!({}));
+        assert!(result.success, "sprite_list_states failed: {}", result.output);
+
+        let result = registry.execute("sprite_state", serde_json::json!({"state": "wave", "one_shot": true}));
+        assert!(result.success, "sprite_state failed: {}", result.output);
+
+        let result = registry.execute("sprite_status", serde_json::json!({}));
+        assert!(result.success, "sprite_status failed: {}", result.output);
+
+        let result = registry.execute("sprite_current_frame", serde_json::json!({}));
+        assert!(result.success, "sprite_current_frame failed: {}", result.output);
     }
 }
