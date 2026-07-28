@@ -1,0 +1,136 @@
+Gremlin Sprite Sheet Spec
+========================
+For the Gremlin desktop character (Wayland layer-shell window).
+https://github.com/M0N0S0DIUM/gremlin
+
+TECHNICAL
+---------
+Format:       PNG, RGBA (transparent background)
+Frame size:   24×24 pixels each
+Sheet size:   672×24 pixels (28 frames × 24px, single horizontal strip)
+Display size: 48×48 (rendered at 2x scale, nearest-neighbor — stays crisp)
+Palette:      Your choice. Current placeholder uses #00ff41 (green phosphor)
+              on transparent. CRT/terminal aesthetic preferred — not cartoon.
+
+Character:    Small round creature with horns/ears, sits bottom-center of frame.
+              Not a cute mascot — a sarcastic senior coworker that lives in
+              your terminal. Two dots for eyes is plenty. Mouth optional.
+
+ORDER (left to right on the sprite sheet)
+=========================================
+
+─── STATE 0: SLEEPING (4 frames, loops at 4fps) ───
+When: Default state. Shown ~90% of the time when Gremlin is idle.
+F0: Breathe in  — body slightly expanded, glow brighter
+F1: Hold       — peak inhale
+F2: Breathe out — body contracted, dimmer
+F3: Rest       — minimum size, faintest glow
+Feel: Peaceful. Curled up. Eyes closed (two horizontal dashes). Unnoticeable.
+
+─── STATE 1: WAKING UP (3 frames, plays ONCE on summon) ───
+When: User presses Super + ' to summon Gremlin. Transitions to AWAKE IDLE.
+F0: Stretch    — arms up, body elongated, eyes still closed
+F1: Rub eyes   — one arm at face, one eye starting to open
+F2: Sit up     — alert posture, both eyes open, ready
+Feel: "Ugh, fine, I'm up." Not rushed. Slightly reluctant.
+
+─── STATE 2: AWAKE IDLE (4 frames, loops at 4fps) ───
+When: Gremlin is summoned but not actively doing anything. Waiting for input.
+F0: Eyes open  — neutral/alert, sitting upright
+F1: Half blink — eyes half-closed (vertical slits, not dashes)
+F2: Eyes shut  — full blink (horizontal dashes like sleeping, but brief)
+F3: Eyes open  — back to neutral, maybe slightly shifted posture
+Feel: Attentive but relaxed. The blink cycle makes it feel alive.
+      Optional: tiny sway (±1px horizontal offset between cycles).
+
+─── STATE 3: READING (2 frames, loops at 3fps) ───
+When: Gremlin is running read_file, git_status, git_diff, or similar tools.
+F0: Eyes left  — pupils/eyes shifted left, tiny glasses on
+F1: Eyes right — pupils/eyes shifted right (scanning text)
+Feel: Focused. Glasses are important visual cue — user should immediately
+      know Gremlin is "reading" something.
+
+─── STATE 4: THINKING (3 frames, loops at 3fps) ───
+When: LLM inference in progress. Gremlin is waiting for Ollama to respond.
+F0: Look up    — eyes aimed upward, slight lean back
+F1: Look down  — eyes aimed downward, hand near chin area
+F2: Chin rub   — hand on chin, eyes narrowed (like "hmm...")
+Feel: Pondering. This is the user's signal that Gremlin is working,
+      not frozen. Should feel like genuine thought, not a loading spinner.
+
+─── STATE 5: BUILDING (3 frames, loops at 2fps) ───
+When: cargo_build or cargo_test is running.
+F0: Sip coffee — tiny cup at mouth area, eyes relaxed
+F1: Watch      — cup lowered, eyes tracking to the side (watching progress)
+F2: Coffee rest— cup resting on lap/knee, patient expression
+Feel: Patient. This is the "watching a long compile" mood. The coffee cup
+      is the key visual — user should know a build is happening.
+
+─── STATE 6: TYPING (3 frames, loops at 6fps — fast!) ───
+When: Gremlin is launching Hermes or writing a file.
+F0: Press left  — left arm down at keyboard position, body hunched
+F1: Press right — right arm down, left arm up
+F2: Press both  — both arms down, slightly different posture
+Feel: Fast, busy, working. Higher framerate (6fps) sells the typing effect.
+      This is the most energetic state. Shows Gremlin is actively doing work.
+
+─── STATE 7: ERROR (2 frames, loops at 2fps) ───
+When: A tool failed, Hermes returned an error, or something went wrong.
+F0: Tilt left  — head tilted ~15° left, "?" visible nearby, eyes open
+F1: Tilt right — head tilted ~15° right, still confused
+Feel: Concerned but not panicked. "You seeing this?" energy.
+      The question mark is important — it's Gremlin's way of saying
+      "something's not right" without speaking.
+
+─── AMBIENT: YAWN (2 frames) ───
+Plays randomly, very rarely, when in AWAKE IDLE state.
+F0: Pre-yawn  — mouth starting to open, eyes half-closed
+F1: Full yawn — mouth wide, eyes fully shut, maybe arms stretch up
+
+─── AMBIENT: SCRATCH EAR (2 frames) ───
+Plays randomly, very rarely, when in AWAKE IDLE state.
+F0: Arm up    — one arm raised toward ear/head
+F1: Scratch   — arm at ear, slight head tilt toward the scratch
+
+─── AMBIENT: CHECK WATCH (2 frames) ───
+Plays randomly, very rarely, when in AWAKE IDLE state.
+F0: Look down — eyes aimed at wrist area, arm raised slightly
+F1: Check     — tiny watch face visible, impatient expression
+Feel: "How long has this build been running?" Very occasional.
+
+LAYOUT SUMMARY
+==============
+Frame 0-3:    Sleeping (4)
+Frame 4-6:    Waking Up (3)
+Frame 7-10:   Awake Idle (4)
+Frame 11-12:  Reading (2)
+Frame 13-15:  Thinking (3)
+Frame 16-18:  Building (3)
+Frame 19-21:  Typing (3)
+Frame 22-23:  Error (2)
+Frame 24-25:  Yawn (2)
+Frame 26-27:  Scratch Ear (2)
+Frame 28-29:  (reserved — Check Watch or future)
+
+EMOTIONAL RANGE
+===============
+Gremlin should never look:
+- Cute/moe/kawaii — it's a coworker, not a pet
+- Angry/aggressive — it's sarcastic, not hostile
+- Sad/pathetic — it's competent, not pitiful
+- Hyperactive — it's understated, not a cartoon
+
+Gremlin should feel like:
+- The senior dev who's seen everything
+- Dry, understated reactions
+- Occasional genuine approval (tiny thumbs up? rare raised eyebrow?)
+- "I'm not mad, I'm just disappointed" energy when things break
+
+WHAT TO IGNORE
+==============
+- Speech bubbles (rendered by the Wayland compositor)
+- Background (transparent — compositor handles the dark CRT background)
+- Scanlines (overlay applied at render time)
+- Smooth animations between states (programmatic tweens, not sprite frames)
+- The summon/dismiss animation (scale transform, not sprites)
+- Progress bars, coffee steam, or other effects (programmatic)
