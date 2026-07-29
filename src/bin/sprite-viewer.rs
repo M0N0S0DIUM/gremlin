@@ -116,12 +116,12 @@ mod linux_impl {
             let attrs = WindowAttributes::default()
                 .with_inner_size(PhysicalSize::new(sz, sz))
                 .with_title("gremlin-sprite")
-                .with_name("gremlin-sprite", "gremlin-sprite")
-                .with_visible(false);
+                .with_name("gremlin-sprite", "gremlin-sprite");
 
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create Wayland window");
+            window.request_redraw();
             self.window = Some(window);
         }
 
