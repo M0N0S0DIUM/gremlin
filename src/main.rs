@@ -149,6 +149,24 @@ async fn check() -> Result<(), GremlinError> {
         Err(e) => eprintln!("  ❌ Failed to check model: {e}"),
     }
 
+    // Check vision model availability if configured
+    let vision_model = config.vision
+        .as_ref()
+        .map(|v| v.model.clone())
+        .unwrap_or_else(|| "llama3.2-vision:11b".to_string());
+
+    let vision_available = crate::vision::vision_model_available(
+        &config.ollama.url,
+        &vision_model,
+    ).await;
+
+    if vision_available {
+        println!("  ✅ Vision model '{}' is available (screenshots enabled)", vision_model);
+    } else {
+        println!("  ⚠️  Vision model '{}' not found — screenshots won't work", vision_model);
+        println!("     Pull it with: ollama pull {}", vision_model);
+    }
+
     Ok(())
 }
 
@@ -158,17 +176,23 @@ async fn run_daemon() -> Result<(), GremlinError> {
     let ollama = Ollama::new(&config.ollama);
     let mut tools = ToolRegistry::new();
 
-    // Initialize sprite system
+    // Initialize sprite system — gracefully skip if assets are missing
     let default_sprite = crate::config::SpriteConfig::default();
     let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
     let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
     let initial_state = &sprite_config.initial_state;
-    let sprite_system = Arc::new(SpriteSystem::new(
-        assets_dir.to_str().unwrap_or("assets/sprites"),
-        initial_state,
-    )?);
-    sprite_system.spawn_ticker();
-    register_sprite_tools(&mut tools, sprite_system);
+    match SpriteSystem::new(assets_dir.to_str().unwrap_or("assets/sprites"), initial_state) {
+        Ok(sprite_system) => {
+            let sprite_system = Arc::new(sprite_system);
+            sprite_system.spawn_ticker();
+            register_sprite_tools(&mut tools, sprite_system);
+            info!("Sprite system loaded ({})", assets_dir.display());
+        }
+        Err(e) => {
+            info!("Sprite system skipped — assets not found at {}: {e}", assets_dir.display());
+            info!("Run `gremlin generate-sprites` to create sprite assets, or place them manually.");
+        }
+    }
 
     // Verify Ollama is reachable before starting
     ollama.health_check().await.map_err(|e| {
@@ -199,16 +223,17 @@ async fn ask(message: &str) -> Result<(), GremlinError> {
     let ollama = Ollama::new(&config.ollama);
     let mut tools = ToolRegistry::new();
 
-    // Initialize sprite system for one-shot mode too
+    // Initialize sprite system for one-shot mode too (graceful skip if assets missing)
     let default_sprite = crate::config::SpriteConfig::default();
     let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
     let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
     let initial_state = &sprite_config.initial_state;
-    let sprite_system = Arc::new(SpriteSystem::new(
+    if let Ok(sprite_system) = SpriteSystem::new(
         assets_dir.to_str().unwrap_or("assets/sprites"),
         initial_state,
-    )?);
-    register_sprite_tools(&mut tools, sprite_system);
+    ) {
+        register_sprite_tools(&mut tools, Arc::new(sprite_system));
+    }
 
     info!("Asking: {}", message);
 

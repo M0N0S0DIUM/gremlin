@@ -1,10 +1,13 @@
 //! sprite-viewer — borderless floating Wayland window that polls the Gremlin
 //! daemon for the current sprite animation frame and renders it at 4x scale.
+//! Roams the screen with a lazy random walk — desktop pet behaviour.
 //!
 //! Linux/Wayland only.  Usage:
 //!   ./target/release/sprite-viewer [scale_factor]
 
+#[allow(dead_code)]
 const FRAME_SIZE: u32 = 48;
+#[allow(dead_code)]
 const DEFAULT_SCALE: u32 = 4;
 
 // ── Linux implementation ──
@@ -15,9 +18,10 @@ mod linux_impl {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
+    use rand::Rng;
     use winit::{
         application::ApplicationHandler,
-        dpi::PhysicalSize,
+        dpi::{PhysicalPosition, PhysicalSize},
         event::WindowEvent,
         event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
         platform::wayland::WindowAttributesExtWayland,
@@ -51,9 +55,7 @@ mod linux_impl {
         let body = resp["response"].as_str()?;
 
         let b64 = body.strip_prefix("data:image/png;base64,")?;
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-            .ok()
-            .into()
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
     }
 
     /// Decode a raw PNG, return RGBA pixels + dimensions.
@@ -87,6 +89,15 @@ mod linux_impl {
         last_frame: Vec<u8>,
         last_poll: Instant,
         display_size: u32,
+        // ── roaming state ──
+        pos_x: f64,
+        pos_y: f64,
+        vel_x: f64,
+        vel_y: f64,
+        last_dir_change: Instant,
+        screen_w: u32,
+        screen_h: u32,
+        rng: rand::rngs::ThreadRng,
     }
 
     impl App {
@@ -98,6 +109,14 @@ mod linux_impl {
                 last_frame: Vec::new(),
                 last_poll: Instant::now(),
                 display_size: FRAME_SIZE * scale,
+                pos_x: 0.0,
+                pos_y: 0.0,
+                vel_x: 0.0,
+                vel_y: 0.0,
+                last_dir_change: Instant::now(),
+                screen_w: 1920,
+                screen_h: 1080,
+                rng: rand::thread_rng(),
             }
         }
 
@@ -122,7 +141,28 @@ mod linux_impl {
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create Wayland window");
-            eprintln!("sprite-viewer: window created {}×{}", sz, sz);
+
+            // Sniff monitor geometry for edge-bouncing
+            if let Some(monitor) = window.current_monitor() {
+                let s = monitor.size();
+                self.screen_w = s.width.max(sz + 64);
+                self.screen_h = s.height.max(sz + 64);
+                // Start bottom-right
+                self.pos_x = (self.screen_w.saturating_sub(sz + 32)) as f64;
+                self.pos_y = (self.screen_h.saturating_sub(sz + 32)) as f64;
+            } else {
+                // Fallback: position at bottom-right of a reasonable default
+                self.pos_x = (self.screen_w.saturating_sub(sz + 32)) as f64;
+                self.pos_y = (self.screen_h.saturating_sub(sz + 32)) as f64;
+            }
+            // Pick initial drift
+            self.randomize_velocity();
+
+            eprintln!(
+                "sprite-viewer: window {}×{} on {}×{}, roaming from ({:.0},{:.0})",
+                sz, sz, self.screen_w, self.screen_h, self.pos_x, self.pos_y
+            );
+            let _ = window.set_outer_position(PhysicalPosition::new(self.pos_x, self.pos_y));
             window.request_redraw();
             self.window = Some(window);
         }
@@ -140,50 +180,116 @@ mod linux_impl {
                 WindowEvent::RedrawRequested => {
                     let Some(window) = self.window.as_ref() else { return };
 
-                    // Poll daemon ~60 Hz
                     let now = Instant::now();
+
+                    // ── Poll daemon ~60 Hz ──
                     if now.duration_since(self.last_poll) >= Duration::from_millis(16) {
                         self.last_poll = now;
-                        if let Some(data) = poll_frame(self.daemon_stream.as_mut().unwrap()) {
-                            if let Some((rgba, w, h)) = decode_png(&data) {
-                                self.last_frame = scale_nearest(&rgba, w, h, self.scale);
-                                static mut FIRST: bool = true;
-                                unsafe {
-                                    if FIRST {
-                                        eprintln!("sprite-viewer: first frame received ({}×{})", w, h);
-                                        FIRST = false;
-                                    }
+                        if let Some(stream) = self.daemon_stream.as_mut() {
+                            if let Some(data) = poll_frame(stream) {
+                                if let Some((rgba, w, h)) = decode_png(&data) {
+                                    self.last_frame = scale_nearest(&rgba, w, h, self.scale);
                                 }
                             }
                         }
                     }
 
-                    // Render
-                    if !self.last_frame.is_empty() {
-                        if let Ok(ctx) = Context::new(window) {
-                            if let Ok(mut surface) = Surface::new(&ctx, window) {
-                                if let Ok(mut buffer) = surface.buffer_mut() {
-                                    let dst = buffer.as_mut();
-                                    for (i, chunk) in self.last_frame.chunks_exact(4).enumerate() {
-                                        if i < dst.len() {
-                                            let r = chunk[0] as u32;
-                                            let g = chunk[1] as u32;
-                                            let b = chunk[2] as u32;
-                                            let a = chunk[3] as u32;
-                                            dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
-                                        }
+                    // ── Roam: update position ──
+                    self.update_roam(now);
+
+                    // ── Render ──
+                    let render_buf: &[u8] = if !self.last_frame.is_empty() {
+                        &self.last_frame
+                    } else {
+                        // Placeholder until first frame arrives: dark green square
+                        // so the window isn't transparent/invisible on startup.
+                        use std::sync::LazyLock;
+                        static PLACEHOLDER: LazyLock<Vec<u8>> = LazyLock::new(|| {
+                                let sz = (FRAME_SIZE * 4) as usize;
+                                let mut buf = vec![0u8; sz * sz * 4];
+                                for y in 0..sz {
+                                    for x in 0..sz {
+                                        let i = (y * sz + x) * 4;
+                                        // Dark CRT green with slight center glow
+                                        let dx = (x as f64 - sz as f64 / 2.0).abs();
+                                        let dy = (y as f64 - sz as f64 / 2.0).abs();
+                                        let dist = (dx * dx + dy * dy).sqrt() / (sz as f64 / 2.0);
+                                        let g = ((1.0 - dist) * 40.0).clamp(0.0, 40.0) as u8;
+                                        buf[i] = 0;
+                                        buf[i + 1] = g;
+                                        buf[i + 2] = 0;
+                                        buf[i + 3] = 255;
                                     }
-                                    let _ = buffer.present();
                                 }
+                                buf
+                            });
+                        &*PLACEHOLDER
+                    };
+
+                    if let Ok(ctx) = Context::new(window) {
+                        if let Ok(mut surface) = Surface::new(&ctx, window) {
+                            if let Ok(mut buffer) = surface.buffer_mut() {
+                                let dst = buffer.as_mut();
+                                for (i, chunk) in render_buf.chunks_exact(4).enumerate() {
+                                    if i < dst.len() {
+                                        let r = chunk[0] as u32;
+                                        let g = chunk[1] as u32;
+                                        let b = chunk[2] as u32;
+                                        let a = chunk[3] as u32;
+                                        dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                                    }
+                                }
+                                let _ = buffer.present();
                             }
                         }
                     }
 
-                    // Chain next redraw to keep the loop alive
                     window.request_redraw();
                 }
                 _ => {}
             }
+        }
+    }
+
+    impl App {
+        /// Advance the roaming position one tick, bouncing off screen edges.
+        fn update_roam(&mut self, now: Instant) {
+            let dt = 0.016; // ~60fps tick
+            let sz = self.display_size as f64;
+            let margin = 16.0;
+
+            // Change direction every 2-5 seconds
+            if now.duration_since(self.last_dir_change) > Duration::from_secs_f64(self.rng.random_range(2.0..5.0)) {
+                self.randomize_velocity();
+                self.last_dir_change = now;
+            }
+
+            // Apply velocity
+            self.pos_x += self.vel_x * dt;
+            self.pos_y += self.vel_y * dt;
+
+            // Bounce off edges — clamp to [margin, screen - sz - margin]
+            let max_x = ((self.screen_w as f64) - sz - margin).max(margin);
+            let max_y = ((self.screen_h as f64) - sz - margin).max(margin);
+            let min_x = margin;
+            let min_y = margin;
+
+            if self.pos_x < min_x { self.pos_x = min_x; self.vel_x = self.vel_x.abs(); }
+            if self.pos_x > max_x { self.pos_x = max_x; self.vel_x = -self.vel_x.abs(); }
+            if self.pos_y < min_y { self.pos_y = min_y; self.vel_y = self.vel_y.abs(); }
+            if self.pos_y > max_y { self.pos_y = max_y; self.vel_y = -self.vel_y.abs(); }
+
+            if let Some(ref window) = self.window {
+                let _ = window.set_outer_position(PhysicalPosition::new(self.pos_x, self.pos_y));
+            }
+        }
+
+        fn randomize_velocity(&mut self) {
+            // Lazy drift: 40-120 px/sec in a random direction
+            let speed: f64 = self.rng.random_range(40.0..120.0);
+            let angle: f64 = self.rng.random_range(0.0..std::f64::consts::TAU);
+            self.vel_x = angle.cos() * speed;
+            self.vel_y = angle.sin() * speed;
         }
     }
 

@@ -161,11 +161,26 @@ impl Config {
 
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            Ok(toml::from_str(&content)?)
+            let config: Config = toml::from_str(&content)?;
+            config.validate()?;
+            Ok(config)
         } else {
             // Return defaults — caller can write them out
-            Ok(Config::default())
+            let config = Config::default();
+            config.validate()?;
+            Ok(config)
         }
+    }
+
+    /// Validate that required fields are present
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.model.name.is_empty() {
+            return Err(ConfigError::MissingField("model.name".into()));
+        }
+        if self.model.system_prompt.is_empty() {
+            return Err(ConfigError::MissingField("model.system_prompt".into()));
+        }
+        Ok(())
     }
 
     /// Write config to disk, creating directories as needed

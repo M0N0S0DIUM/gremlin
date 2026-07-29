@@ -441,6 +441,7 @@ impl ToolRegistry {
     }
 
     /// Get the tools schema for the LLM (for function calling / tool-use prompt)
+    #[allow(dead_code)] // reserved for native function calling support
     pub fn tools_schema(&self) -> &[Tool] {
         &self.tools
     }

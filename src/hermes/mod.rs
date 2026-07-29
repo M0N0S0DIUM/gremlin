@@ -107,8 +107,17 @@ pub async fn launch(
     // Wait with timeout
     let output = tokio::task::spawn_blocking(move || {
         child.wait_with_output()
-    })
+    });
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(HERMES_TIMEOUT_SECS),
+        output,
+    )
     .await
+    .map_err(|_| GremlinError::Tool(format!(
+        "Hermes timed out after {} seconds",
+        HERMES_TIMEOUT_SECS
+    )))?
     .map_err(|e| GremlinError::Tool(format!("Hermes task panicked: {e}")))?
     .map_err(|e| GremlinError::Tool(format!("Hermes process error: {e}")))?;
 

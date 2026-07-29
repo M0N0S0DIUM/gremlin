@@ -23,6 +23,7 @@ image = "0.25"
 # sprite-viewer binary (Wayland window for floating sprite)
 winit = "0.30"
 softbuffer = "0.4"
+rand = "0.8"
 
 [[bin]]
 name = "gremlin"

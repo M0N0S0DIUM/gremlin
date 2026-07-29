@@ -93,6 +93,50 @@ Gremlin has 18 built-in tools across 7 categories:
 - **Hyprland** (for desktop awareness tools — optional, tools fail gracefully)
 - **Hermes** CLI (for coding delegation — optional)
 
+## Sprite Viewer (Hyprland Window Rules)
+
+The sprite-viewer (`gremlin-sprite`) renders Gremlin as a floating desktop mascot via Wayland. Add these rules to your `~/.config/hypr/hyprland.conf`:
+
+```ini
+# Gremlin sprite — borderless floating mascot window (Hyprland ≥ 0.53)
+windowrule = match:class ^(gremlin-sprite)$, float on, pin on, noborder on, noshadow on, nofocus on, noanim on, size 192 192, move 100%-220 100%-220
+```
+
+> **Hyprland < 0.53:** use the older `windowrulev2` syntax instead:
+> ```ini
+> windowrulev2 = float, class:^(gremlin-sprite)$
+> windowrulev2 = pin, class:^(gremlin-sprite)$
+> windowrulev2 = noborder, class:^(gremlin-sprite)$
+> windowrulev2 = noshadow, class:^(gremlin-sprite)$
+> windowrulev2 = nofocus, class:^(gremlin-sprite)$
+> windowrulev2 = noanim, class:^(gremlin-sprite)$
+> windowrulev2 = size 192 192, class:^(gremlin-sprite)$
+> windowrulev2 = move 100%-220 100%-220, class:^(gremlin-sprite)$
+> ```
+
+| Rule | Purpose |
+|---|---|
+| `float` | Don't tile the sprite — keep it floating |
+| `pin` | Show on all workspaces |
+| `noborder` | No window decorations |
+| `noshadow` | No drop shadow |
+| `nofocus` | Don't steal keyboard focus |
+| `noanim` | Skip window open/close animations |
+| `size 192 192` | 48px sprite × 4x scale |
+| `move` | Position in bottom-right corner |
+
+Start the sprite viewer alongside the daemon:
+
+```bash
+# Terminal 1: start the daemon
+gremlin daemon
+
+# Terminal 2: start the sprite (4x scale)
+./target/release/sprite-viewer 4
+```
+
+> **Note:** You need sprite assets in `assets/sprites/` (a PNG sprite sheet + frame map JSON). Without these, the daemon runs fine but sprite tools are unavailable. See `assets/sprites/` for the expected file layout.
+
 ## License
 
 MIT

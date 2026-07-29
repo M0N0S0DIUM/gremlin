@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::config::Config;
@@ -27,30 +25,57 @@ pub fn socket_path() -> std::path::PathBuf {
 
 /// A conversation session — persists between queries in daemon mode.
 /// Single-user: one conversation per daemon. Cleared with `/clear`.
+/// Auto-saves to ~/.config/gremlin/conversation.json on each message.
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub session_id: String,
+    save_path: Option<std::path::PathBuf>,
 }
 
 impl Conversation {
+    /// Create a new conversation. If a save file exists at the default path,
+    /// loads previous messages from it.
+    #[allow(dead_code)] // used by unix_daemon on Linux, dead on other platforms
     pub fn new() -> Self {
+        let save_path = conversation_save_path();
+        // Try to load existing conversation
+        if let Some(ref path) = save_path {
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(path) {
+                    if let Ok(saved) = serde_json::from_str::<ConversationData>(&data) {
+                        info!(
+                            session = %saved.session_id,
+                            messages = saved.messages.len(),
+                            "Loaded previous conversation"
+                        );
+                        return Self {
+                            messages: saved.messages,
+                            session_id: saved.session_id,
+                            save_path: Some(path.clone()),
+                        };
+                    }
+                }
+            }
+        }
         Self {
             messages: Vec::new(),
             session_id: uuid_v4(),
+            save_path,
         }
     }
 
     /// Clear the conversation — reset to system prompt only.
     pub fn clear(&mut self) {
-        // Keep system messages, drop the rest
         self.messages.retain(|m| m.role == "system");
         self.session_id = uuid_v4();
+        self.save();
         info!(session = %self.session_id, "Conversation cleared");
     }
 
     /// Add a message to the conversation.
     pub fn push(&mut self, msg: Message) {
         self.messages.push(msg);
+        self.save();
     }
 
     /// Trim old messages if the conversation gets too long (keep last ~40 messages).
@@ -77,7 +102,24 @@ impl Conversation {
                 .collect();
             self.messages = keep_system;
             self.messages.extend(recent);
+            self.save();
             debug!("Conversation trimmed to {} messages", self.messages.len());
+        }
+    }
+
+    /// Persist conversation to disk (called after push, clear, trim).
+    fn save(&self) {
+        if let Some(ref path) = self.save_path {
+            let data = ConversationData {
+                session_id: self.session_id.clone(),
+                messages: self.messages.clone(),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&data) {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, json);
+            }
         }
     }
 
@@ -93,6 +135,18 @@ impl Conversation {
         msgs.extend(self.messages.clone());
         msgs
     }
+}
+
+/// Serializable conversation data for disk persistence.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConversationData {
+    session_id: String,
+    messages: Vec<Message>,
+}
+
+/// Path to the conversation save file.
+fn conversation_save_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("gremlin").join("conversation.json"))
 }
 
 fn uuid_v4() -> String {
@@ -269,6 +323,8 @@ pub async fn query(
 
 #[cfg(unix)]
 mod unix_daemon {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
     use tracing::{error, info};

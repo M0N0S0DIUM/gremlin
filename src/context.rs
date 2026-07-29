@@ -13,6 +13,7 @@ pub struct Context {
     // Desktop awareness (Hyprland — gracefully absent when not available)
     pub active_window: Option<String>,
     pub active_workspace: Option<String>,
+    pub desktop_summary: Option<String>,
 }
 
 impl Context {
@@ -38,7 +39,21 @@ impl Context {
             ctx.git_status = Some(result.output);
         }
 
-        // Desktop awareness — active window
+        // Git diff (for context — key for coding workflows)
+        let result = tools.execute("git_diff", serde_json::json!({"staged": false}));
+        if result.success && !result.output.is_empty() {
+            ctx.git_diff = Some(result.output);
+        }
+
+        // Desktop awareness — rich summary (monitors, workspaces, focused window)
+        match crate::desktop::hyprland::desktop_summary() {
+            Ok(summary) if !summary.is_empty() => {
+                ctx.desktop_summary = Some(summary);
+            }
+            _ => {}
+        }
+
+        // Desktop awareness — active window (individual, for targeted context)
         let result = tools.execute("active_window", serde_json::json!({}));
         if result.success {
             ctx.active_window = Some(result.output);
@@ -66,8 +81,21 @@ impl Context {
         if let Some(ref status) = self.git_status {
             parts.push(format!("Git status:\n{status}"));
         }
+        if let Some(ref diff) = self.git_diff {
+            // Truncate very large diffs in the prompt
+            let truncated = if diff.len() > 4000 {
+                format!("{}...\n(truncated, {} chars total)", &diff[..4000], diff.len())
+            } else {
+                diff.clone()
+            };
+            parts.push(format!("Git diff (unstaged):\n{truncated}"));
+        }
         if let Some(ref project) = self.current_project {
             parts.push(format!("Current project: {project}"));
+        }
+        // Desktop summary — richest context first
+        if let Some(ref summary) = self.desktop_summary {
+            parts.push(format!("Desktop:\n{summary}"));
         }
         if let Some(ref win) = self.active_window {
             parts.push(format!("Active window: {win}"));

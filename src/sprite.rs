@@ -37,6 +37,7 @@ pub type Frame = ImageBuffer<Rgba<u8>, Vec<u8>>;
 pub struct SpriteSheet {
     pub meta: SpriteSheetMeta,
     pub frames: Vec<Frame>,
+    #[allow(dead_code)] // stored for completeness, accessible via meta.frame_size
     pub frame_size: u32,
 }
 
@@ -213,6 +214,7 @@ impl AnimationController {
         &self.sheet.frames[global_idx]
     }
 
+    #[allow(dead_code)] // API for external callers / future interactive control
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
     }

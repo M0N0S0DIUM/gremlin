@@ -52,6 +52,7 @@ pub struct ModelInfo {
 
 /// A parsed tool call extracted from the model's response text
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // used by parse_tool_call return type, constructed via tuple
 pub struct ToolCall {
     pub name: String,
     pub args: serde_json::Value,
@@ -111,16 +112,35 @@ impl Ollama {
             keep_alive: keep_alive.or_else(|| Some(self.default_keep_alive.clone())),
         };
 
-        let resp: ChatResponse = self
+        let resp = self
             .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&request)
             .send()
-            .await?
-            .json()
             .await?;
 
-        Ok(resp.message.content)
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+
+            // Detect model-not-found from Ollama's error response
+            if status.as_u16() == 404
+                || body.contains("not found")
+                || body.contains("model")
+            {
+                return Err(OllamaError::ModelNotFound {
+                    model: model.to_string(),
+                });
+            }
+
+            return Err(OllamaError::Unreachable {
+                url: self.base_url.clone(),
+                detail: format!("HTTP {status}: {body}"),
+            });
+        }
+
+        let chat_resp: ChatResponse = resp.json().await?;
+        Ok(chat_resp.message.content)
     }
 
     /// Quick check: does a model exist locally?

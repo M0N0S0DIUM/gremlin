@@ -23,6 +23,8 @@ fn hyprctl_json<T: for<'de> Deserialize<'de>>(args: &[&str]) -> Result<T, Gremli
 }
 
 /// Run `hyprctl <args...>` and return raw stdout (no -j flag).
+/// Used for commands that don't support JSON output.
+#[allow(dead_code)]
 fn hyprctl_raw(args: &[&str]) -> Result<String, GremlinError> {
     let output = std::process::Command::new("hyprctl")
         .args(args)
@@ -40,6 +42,7 @@ fn hyprctl_raw(args: &[&str]) -> Result<String, GremlinError> {
 // ── JSON types for hyprctl output ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields read via serde deserialization
 pub struct WindowInfo {
     pub title: String,
     pub class: String,
@@ -52,6 +55,7 @@ pub struct WindowInfo {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)] // fields read via serde deserialization
 pub struct WorkspaceRef {
     #[serde(default)]
     pub id: i64,
@@ -70,6 +74,7 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields read via serde deserialization
 pub struct MonitorInfo {
     pub id: i64,
     pub name: String,
