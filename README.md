@@ -72,17 +72,18 @@ desktop = "hyprland"
 
 ## Tools
 
-Gremlin has 18 built-in tools across 7 categories:
+Gremlin has 25 built-in tools across 8 categories:
 
 | Category | Tools |
 |---|---|
 | Filesystem | `read_file`, `write_file`, `pwd`, `list_dir` |
 | Git | `git_status`, `git_diff`, `git_branch` |
 | Desktop (Hyprland) | `active_window`, `active_workspace`, `list_workspaces`, `list_monitors` |
-| Clipboard | `clipboard` |
+| Clipboard | `clipboard`, `clipboard_write` |
 | Cargo | `cargo_build`, `cargo_check`, `cargo_test` |
 | Shell | `recent_commands`, `kitty_cwd` |
 | Hermes | `launch_hermes` (code_review, bug_fix, architecture, refactor, explain, documentation) |
+| Memory | `memory_search`, `memory_fact`, `memory_pref`, `memory_recommend`, `memory_self_modify`, `memory_stats` |
 
 ## Requirements
 
@@ -132,7 +133,7 @@ Start the sprite viewer alongside the daemon:
 gremlin daemon
 
 # Terminal 2: start the sprite (4x scale)
-./target/release/sprite-viewer 4
+sprite-viewer 4
 ```
 
 > **Note:** You need sprite assets in `assets/sprites/` (a PNG sprite sheet + frame map JSON). Without these, the daemon runs fine but sprite tools are unavailable. See `assets/sprites/` for the expected file layout.
