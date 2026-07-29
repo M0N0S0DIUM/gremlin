@@ -23,7 +23,7 @@ mod linux_impl {
         platform::wayland::WindowAttributesExtWayland,
         window::{Window, WindowAttributes, WindowId},
     };
-    use softbuffer::Surface;
+    use softbuffer::{Context, Surface};
 
     use super::{FRAME_SIZE, DEFAULT_SCALE};
 
@@ -52,12 +52,9 @@ mod linux_impl {
 
         // Response format: "data:image/png;base64,<base64>"
         let b64 = body.strip_prefix("data:image/png;base64,")?;
-        base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            b64,
-        )
-        .ok()
-        .into()
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .ok()
+            .into()
     }
 
     /// Decode a raw PNG, return RGBA pixels + dimensions.
@@ -86,6 +83,8 @@ mod linux_impl {
 
     pub struct App {
         window: Option<Window>,
+        context: Option<Context>,
+        surface: Option<Surface>,
         scale: u32,
         daemon_stream: Option<UnixStream>,
         last_frame: Vec<u8>,
@@ -97,12 +96,18 @@ mod linux_impl {
         pub fn new(scale: u32) -> Self {
             Self {
                 window: None,
+                context: None,
+                surface: None,
                 scale,
                 daemon_stream: None,
                 last_frame: Vec::new(),
                 last_poll: Instant::now(),
                 display_size: FRAME_SIZE * scale,
             }
+        }
+
+        pub fn set_daemon_stream(&mut self, stream: UnixStream) {
+            self.daemon_stream = Some(stream);
         }
     }
 
@@ -116,23 +121,33 @@ mod linux_impl {
             let attrs = WindowAttributes::default()
                 .with_inner_size(PhysicalSize::new(sz, sz))
                 .with_title("gremlin-sprite")
-                .with_name("gremlin-sprite", "gremlin-sprite") // Wayland app_id (= Hyprland "class")
+                .with_name("gremlin-sprite", "gremlin-sprite")
                 .with_visible(false);
 
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create Wayland window");
+
+            // softbuffer context + surface from the winit window
+            let context = Context::new(&window).expect("failed to create softbuffer context");
+            let surface = Surface::new(&context, &window).expect("failed to create softbuffer surface");
+
+            self.context = Some(context);
+            self.surface = Some(surface);
             self.window = Some(window);
         }
 
-        fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        fn window_event(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            _id: WindowId,
+            event: WindowEvent,
+        ) {
             match event {
                 WindowEvent::CloseRequested => {
                     event_loop.exit();
                 }
                 WindowEvent::RedrawRequested => {
-                    let window = self.window.as_ref().unwrap();
-
                     // Poll daemon ~60 Hz
                     let now = Instant::now();
                     if now.duration_since(self.last_poll) >= Duration::from_millis(16) {
@@ -146,7 +161,7 @@ mod linux_impl {
 
                     // Render via softbuffer
                     if !self.last_frame.is_empty() {
-                        if let Ok(mut surface) = Surface::new(window) {
+                        if let Some(ref mut surface) = self.surface {
                             if let Ok(mut buffer) = surface.buffer_mut() {
                                 let dst = buffer.as_mut();
                                 for (i, chunk) in self.last_frame.chunks_exact(4).enumerate() {
@@ -167,6 +182,16 @@ mod linux_impl {
             }
         }
     }
+
+    /// Run the event loop (called from main).
+    pub fn run(stream: UnixStream, scale: u32) {
+        let event_loop = EventLoop::new().expect("failed to create event loop");
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        let mut app = App::new(scale);
+        app.set_daemon_stream(stream);
+        let _ = event_loop.run_app(&mut app);
+    }
 }
 
 // ── Entry point ──
@@ -183,23 +208,16 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        use linux_impl::*;
-
         let scale: u32 = std::env::args()
             .nth(1)
             .and_then(|a| a.parse().ok())
             .unwrap_or(DEFAULT_SCALE);
 
-        let stream = connect_daemon().expect(
+        let stream = linux_impl::connect_daemon().expect(
             "Gremlin daemon not running? Start it first: gremlin daemon\n\
              Socket is at $XDG_RUNTIME_DIR/gremlin.sock",
         );
 
-        let event_loop = EventLoop::new().expect("failed to create event loop");
-        event_loop.set_control_flow(ControlFlow::Poll);
-
-        let mut app = App::new(scale);
-        app.daemon_stream = Some(stream);
-        let _ = event_loop.run_app(&mut app);
+        linux_impl::run(stream, scale);
     }
 }
