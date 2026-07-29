@@ -4,6 +4,7 @@ mod daemon;
 mod desktop;
 mod error;
 mod hermes;
+mod memory;
 mod ollama;
 mod sprite;
 mod tools;
@@ -15,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::error::GremlinError;
+use crate::memory::Memory;
 use crate::ollama::Ollama;
 use crate::sprite::{register_sprite_tools, SpriteSystem};
 use crate::tools::ToolRegistry;

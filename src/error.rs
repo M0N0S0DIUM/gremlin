@@ -16,6 +16,9 @@ pub enum GremlinError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 #[derive(Error, Debug)]
