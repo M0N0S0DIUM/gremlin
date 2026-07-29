@@ -56,7 +56,7 @@ impl Conversation {
         }
         Self {
             messages: Vec::new(),
-            session_id: uuid_v4(),
+            session_id: generate_session_id(),
             save_path,
         }
     }
@@ -64,7 +64,7 @@ impl Conversation {
     /// Clear the conversation — reset to system prompt only.
     pub fn clear(&mut self) {
         self.messages.retain(|m| m.role == "system");
-        self.session_id = uuid_v4();
+        self.session_id = generate_session_id();
         self.save();
         info!(session = %self.session_id, "Conversation cleared");
     }
@@ -146,11 +146,15 @@ fn conversation_save_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("gremlin").join("conversation.json"))
 }
 
-fn uuid_v4() -> String {
+/// Generate a session identifier. NOT a real UUID (no `uuid` crate dependency) —
+/// just a hex-encoded nanosecond timestamp. Good enough for a single-user daemon
+/// where collisions would require two sessions starting in the same nanosecond,
+/// but the name shouldn't imply RFC 4122 compliance.
+fn generate_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default() // clock before epoch is absurd but shouldn't panic
         .as_nanos();
     format!("{:016x}", t)
 }
@@ -253,6 +257,13 @@ pub async fn query(
     };
 
     messages.push(Message::user(user_message));
+
+    // Save the user's turn to conversation history too — previously only
+    // assistant/tool-result messages were persisted, so reloaded conversations
+    // had no user turns and looked incoherent to the model.
+    if let Some(ref mut conv) = conversation {
+        conv.push(Message::user(user_message));
+    }
 
     // Tool-use loop
     for _iteration in 0..5 {
@@ -378,7 +389,19 @@ mod unix_daemon {
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
 
-        buf_reader.read_line(&mut line).await?;
+        // Bound the read with a timeout — a client that connects but never
+        // sends a line (or sends one without a trailing newline) would
+        // otherwise block this connection's task forever. It doesn't block
+        // OTHER clients (each connection gets its own spawned task and the
+        // conversation mutex isn't locked until after this read), but a
+        // leaked task per hung client is still a resource leak worth capping.
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
+            Ok(Ok(0)) => return Err(GremlinError::Tool("client disconnected before sending a request".into())),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(GremlinError::Tool("client did not send a request within 30s".into())),
+        }
 
         let request: serde_json::Value = serde_json::from_str(line.trim())?;
 

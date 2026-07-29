@@ -42,9 +42,9 @@ pub fn read() -> Result<String, GremlinError> {
 /// Write text to the clipboard.
 pub fn write(text: &str) -> Result<(), GremlinError> {
     let cmd = if command_exists("wl-copy") {
-        format!("wl-copy")
+        "wl-copy".to_string()
     } else if command_exists("xclip") {
-        format!("xclip -selection clipboard")
+        "xclip -selection clipboard".to_string()
     } else {
         return Err(GremlinError::Tool(
             "No clipboard tool available. Install wl-clipboard (Wayland) or xclip (X11).".into(),

@@ -12,14 +12,21 @@
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-DRY_RUN=false; [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+DRY_RUN=false
+SCALE="${GREMLIN_SPRITE_SCALE:-4}"
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --scale=*) SCALE="${arg#--scale=}" ;;
+    esac
+done
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="${HOME}/.cargo/bin"
 DATA_DIR="${HOME}/.local/share/gremlin"
 HYPR_CONF="${HOME}/.config/hypr/hyprland.conf"
 WINDOWRULE='windowrule = match:class ^(gremlin-sprite)$, float on, pin on, noborder on, noshadow on, nofocus on, noanim on, size 192 192, move 100%-220 100%-220'
-EXEC_ONCE="exec-once = ${BIN_DIR}/sprite-viewer 4"
+EXEC_ONCE="exec-once = ${BIN_DIR}/sprite-viewer ${SCALE}"
 
 ok()  { echo -e "${GREEN}✓${NC} $1"; }
 warn(){ echo -e "${YELLOW}⚠${NC} $1"; }

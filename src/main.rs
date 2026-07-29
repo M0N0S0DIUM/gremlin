@@ -344,15 +344,29 @@ fn handle_service(action: ServiceAction) -> Result<(), GremlinError> {
 
             std::fs::write(&service_path, &service_content)?;
 
-            Command::new("systemctl")
+            let status = Command::new("systemctl")
                 .args(["--user", "daemon-reload"])
                 .status()
                 .map_err(|e| GremlinError::Tool(format!("systemctl not available: {e}")))?;
+            if !status.success() {
+                return Err(GremlinError::Tool(format!(
+                    "systemctl daemon-reload failed (exit {}). Check the unit file at {}",
+                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    service_path.display()
+                )));
+            }
 
-            Command::new("systemctl")
+            let status = Command::new("systemctl")
                 .args(["--user", "enable", "--now", "gremlin.service"])
                 .status()
                 .map_err(|e| GremlinError::Tool(format!("Failed to enable service: {e}")))?;
+            if !status.success() {
+                return Err(GremlinError::Tool(format!(
+                    "systemctl enable --now gremlin.service failed (exit {}). \
+                     Run `systemctl --user status gremlin` for details.",
+                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                )));
+            }
 
             println!("✅ Gremlin service installed and started");
             println!("   Check status: systemctl --user status gremlin");

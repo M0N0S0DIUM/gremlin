@@ -68,8 +68,20 @@ impl Context {
         ctx
     }
 
-    /// Build a context string to prepend to the user's prompt
+    /// Build a context string to prepend to the user's prompt (includes git diff).
     pub fn to_prompt_string(&self) -> String {
+        self.to_prompt_string_impl(true)
+    }
+
+    /// Same as `to_prompt_string`, but omits the git diff section — used by
+    /// Hermes prompt templates that set `include_diff: false` (architecture,
+    /// explain, documentation) so the diff doesn't clutter prompts that don't
+    /// need it.
+    pub fn to_prompt_string_without_diff(&self) -> String {
+        self.to_prompt_string_impl(false)
+    }
+
+    fn to_prompt_string_impl(&self, include_diff: bool) -> String {
         let mut parts = Vec::new();
 
         if let Some(ref dir) = self.working_directory {
@@ -81,14 +93,16 @@ impl Context {
         if let Some(ref status) = self.git_status {
             parts.push(format!("Git status:\n{status}"));
         }
-        if let Some(ref diff) = self.git_diff {
-            // Truncate very large diffs in the prompt
-            let truncated = if diff.len() > 4000 {
-                format!("{}...\n(truncated, {} chars total)", &diff[..4000], diff.len())
-            } else {
-                diff.clone()
-            };
-            parts.push(format!("Git diff (unstaged):\n{truncated}"));
+        if include_diff {
+            if let Some(ref diff) = self.git_diff {
+                // Truncate very large diffs in the prompt
+                let truncated = if diff.len() > 4000 {
+                    format!("{}...\n(truncated, {} chars total)", &diff[..4000], diff.len())
+                } else {
+                    diff.clone()
+                };
+                parts.push(format!("Git diff (unstaged):\n{truncated}"));
+            }
         }
         if let Some(ref project) = self.current_project {
             parts.push(format!("Current project: {project}"));

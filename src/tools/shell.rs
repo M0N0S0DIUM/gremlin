@@ -40,22 +40,29 @@ pub fn kitty_cwd() -> Result<String, GremlinError> {
         Ok(out) if out.status.success() => {
             let json: serde_json::Value = serde_json::from_slice(&out.stdout)
                 .map_err(|e| GremlinError::Tool(format!("kitty JSON parse error: {e}")))?;
-            
-            // Find the focused tab and extract cwd
-            if let Some(tabs) = json.as_array() {
-                for os_window in tabs {
+
+            // `kitty @ ls` returns [os_window, ...] -> os_window.tabs[] -> tab.windows[].
+            // `is_focused` lives on the *window* object, not the tab — the previous
+            // version checked tab["is_focused"], which is never present, so this
+            // always fell through to the current_dir() fallback below.
+            if let Some(os_windows) = json.as_array() {
+                for os_window in os_windows {
                     if let Some(tabs_list) = os_window["tabs"].as_array() {
                         for tab in tabs_list {
-                            if tab["is_focused"].as_bool() == Some(true) {
-                                if let Some(cwd) = tab["cwd"].as_str() {
-                                    return Ok(cwd.to_string());
+                            if let Some(windows) = tab["windows"].as_array() {
+                                for window in windows {
+                                    if window["is_focused"].as_bool() == Some(true) {
+                                        if let Some(cwd) = window["cwd"].as_str() {
+                                            return Ok(cwd.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            
+
             Err(GremlinError::Tool("Could not find focused Kitty tab cwd".into()))
         }
         _ => {

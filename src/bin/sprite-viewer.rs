@@ -16,6 +16,7 @@ const DEFAULT_SCALE: u32 = 4;
 mod linux_impl {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use rand::Rng;
@@ -35,37 +36,68 @@ mod linux_impl {
     /// Retries with backoff for up to ~60s — at login the daemon (systemd)
     /// may still be starting when Hyprland's exec-once launches us.
     pub fn connect_daemon() -> Result<UnixStream, String> {
-        let sock = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            format!("{dir}/gremlin.sock")
-        } else {
-            let uid = unsafe { libc::getuid() };
-            format!("/tmp/gremlin-{uid}.sock")
-        };
-        let mut delay = std::time::Duration::from_millis(500);
-        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut delay = Duration::from_millis(500);
         loop {
-            match UnixStream::connect(&sock) {
+            match try_connect_once() {
                 Ok(s) => return Ok(s),
                 Err(e) if Instant::now() < deadline => {
-                    eprintln!("sprite-viewer: waiting for daemon at {sock} ({e}), retrying...");
+                    eprintln!("sprite-viewer: waiting for daemon ({e}), retrying...");
                     std::thread::sleep(delay);
-                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                    delay = (delay * 2).min(Duration::from_secs(5));
                 }
-                Err(e) => return Err(format!("cannot connect to {sock} after 60s: {e}")),
+                Err(e) => return Err(format!("cannot connect to daemon after 60s: {e}")),
             }
         }
     }
 
+    fn socket_path() -> String {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            format!("{dir}/gremlin.sock")
+        } else {
+            let uid = unsafe { libc::getuid() };
+            format!("/tmp/gremlin-{uid}.sock")
+        }
+    }
+
+    fn try_connect_once() -> Result<UnixStream, String> {
+        let sock = socket_path();
+        UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))
+    }
+
     /// Call `sprite_current_frame` directly on the daemon (bypasses LLM).
+    /// Reads the full response by looping until a newline is seen or the
+    /// buffer is exhausted, instead of trusting a single `read()` call to
+    /// return the whole frame — a base64+JSON-wrapped 192×192 PNG can exceed
+    /// a single fixed-size read, especially over a Unix socket where the
+    /// kernel is free to hand back partial writes in arbitrarily small chunks.
     pub fn poll_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
         let req = serde_json::json!({"tool":"sprite_current_frame"});
         let mut req_bytes = serde_json::to_vec(&req).ok()?;
         req_bytes.push(b'\n');
         stream.write_all(&req_bytes).ok()?;
 
-        let mut buf = [0u8; 16384];
-        let n = stream.read(&mut buf).ok()?;
-        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).ok()?;
+        let mut buf = Vec::with_capacity(64 * 1024);
+        let mut chunk = [0u8; 16384];
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                // Peer closed the connection mid-response.
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.contains(&b'\n') {
+                break;
+            }
+            // Sanity cap: a single sprite frame response should never approach
+            // this size; bail rather than buffer unboundedly on a corrupt stream.
+            if buf.len() > 8 * 1024 * 1024 {
+                return None;
+            }
+        }
+
+        let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..line_end]).ok()?;
         let body = resp["response"].as_str()?;
 
         let b64 = body.strip_prefix("data:image/png;base64,")?;
@@ -97,11 +129,18 @@ mod linux_impl {
     }
 
     pub struct App {
-        window: Option<Window>,
+        window: Option<Rc<Window>>,
+        // Created once in `resumed()` and reused every frame — softbuffer 0.4's
+        // Context/Surface are generic over the window handle type, but that
+        // becomes a *nameable, storable* type once the handle is an owned Rc
+        // (rather than a borrow with an awkward self-referential lifetime), so
+        // there's no need to reconstruct these ~60 times/sec.
+        surface: Option<Surface<Rc<Window>, Rc<Window>>>,
         scale: u32,
         daemon_stream: Option<UnixStream>,
         last_frame: Vec<u8>,
         last_poll: Instant,
+        last_reconnect_attempt: Instant,
         display_size: u32,
         // ── roaming state ──
         pos_x: f64,
@@ -118,10 +157,12 @@ mod linux_impl {
         pub fn new(scale: u32) -> Self {
             Self {
                 window: None,
+                surface: None,
                 scale,
                 daemon_stream: None,
                 last_frame: Vec::new(),
                 last_poll: Instant::now(),
+                last_reconnect_attempt: Instant::now(),
                 display_size: FRAME_SIZE * scale,
                 pos_x: 0.0,
                 pos_y: 0.0,
@@ -152,24 +193,32 @@ mod linux_impl {
                 .with_name("gremlin-sprite", "gremlin-sprite")
                 .with_visible(true);
 
-            let window = event_loop
-                .create_window(attrs)
-                .expect("failed to create Wayland window");
+            let window = Rc::new(
+                event_loop
+                    .create_window(attrs)
+                    .expect("failed to create Wayland window"),
+            );
+
+            // Create the softbuffer Context+Surface once here, not per frame.
+            match Context::new(window.clone()) {
+                Ok(ctx) => match Surface::new(&ctx, window.clone()) {
+                    Ok(surface) => self.surface = Some(surface),
+                    Err(e) => eprintln!("sprite-viewer: failed to create surface: {e}"),
+                },
+                Err(e) => eprintln!("sprite-viewer: failed to create softbuffer context: {e}"),
+            }
 
             // Sniff monitor geometry for edge-bouncing
             if let Some(monitor) = window.current_monitor() {
                 let s = monitor.size();
                 self.screen_w = s.width.max(sz + 64);
                 self.screen_h = s.height.max(sz + 64);
-                // Start bottom-right
                 self.pos_x = (self.screen_w.saturating_sub(sz + 32)) as f64;
                 self.pos_y = (self.screen_h.saturating_sub(sz + 32)) as f64;
             } else {
-                // Fallback: position at bottom-right of a reasonable default
                 self.pos_x = (self.screen_w.saturating_sub(sz + 32)) as f64;
                 self.pos_y = (self.screen_h.saturating_sub(sz + 32)) as f64;
             }
-            // Pick initial drift
             self.randomize_velocity();
 
             eprintln!(
@@ -198,13 +247,35 @@ mod linux_impl {
 
                     let now = Instant::now();
 
-                    // ── Poll daemon ~60 Hz ──
+                    // ── Poll daemon ~60 Hz, with reconnect-on-failure ──
                     if now.duration_since(self.last_poll) >= Duration::from_millis(16) {
                         self.last_poll = now;
+                        let mut poll_failed = false;
                         if let Some(stream) = self.daemon_stream.as_mut() {
-                            if let Some(data) = poll_frame(stream) {
-                                if let Some((rgba, w, h)) = decode_png(&data) {
-                                    self.last_frame = scale_nearest(&rgba, w, h, self.scale);
+                            match poll_frame(stream) {
+                                Some(data) => {
+                                    if let Some((rgba, w, h)) = decode_png(&data) {
+                                        self.last_frame = scale_nearest(&rgba, w, h, self.scale);
+                                    }
+                                }
+                                None => poll_failed = true,
+                            }
+                        }
+                        // If the daemon connection died (restarted, socket closed),
+                        // drop it and retry a fresh connection every couple of
+                        // seconds instead of freezing on the last frame forever.
+                        if poll_failed
+                            && now.duration_since(self.last_reconnect_attempt) >= Duration::from_secs(2)
+                        {
+                            self.last_reconnect_attempt = now;
+                            self.daemon_stream = None;
+                            match super::connect_daemon_once() {
+                                Ok(stream) => {
+                                    eprintln!("sprite-viewer: reconnected to daemon");
+                                    self.daemon_stream = Some(stream);
+                                }
+                                Err(e) => {
+                                    eprintln!("sprite-viewer: reconnect failed ({e}), will retry");
                                 }
                             }
                         }
@@ -225,42 +296,39 @@ mod linux_impl {
                         // so the window isn't transparent/invisible on startup.
                         use std::sync::LazyLock;
                         static PLACEHOLDER: LazyLock<Vec<u8>> = LazyLock::new(|| {
-                                let sz = (FRAME_SIZE * 4) as usize;
-                                let mut buf = vec![0u8; sz * sz * 4];
-                                for y in 0..sz {
-                                    for x in 0..sz {
-                                        let i = (y * sz + x) * 4;
-                                        // Dark CRT green with slight center glow
-                                        let dx = (x as f64 - sz as f64 / 2.0).abs();
-                                        let dy = (y as f64 - sz as f64 / 2.0).abs();
-                                        let dist = (dx * dx + dy * dy).sqrt() / (sz as f64 / 2.0);
-                                        let g = ((1.0 - dist) * 40.0).clamp(0.0, 40.0) as u8;
-                                        buf[i] = 0;
-                                        buf[i + 1] = g;
-                                        buf[i + 2] = 0;
-                                        buf[i + 3] = 255;
-                                    }
+                            let sz = (FRAME_SIZE * 4) as usize;
+                            let mut buf = vec![0u8; sz * sz * 4];
+                            for y in 0..sz {
+                                for x in 0..sz {
+                                    let i = (y * sz + x) * 4;
+                                    let dx = (x as f64 - sz as f64 / 2.0).abs();
+                                    let dy = (y as f64 - sz as f64 / 2.0).abs();
+                                    let dist = (dx * dx + dy * dy).sqrt() / (sz as f64 / 2.0);
+                                    let g = ((1.0 - dist) * 40.0).clamp(0.0, 40.0) as u8;
+                                    buf[i] = 0;
+                                    buf[i + 1] = g;
+                                    buf[i + 2] = 0;
+                                    buf[i + 3] = 255;
                                 }
-                                buf
-                            });
+                            }
+                            buf
+                        });
                         &*PLACEHOLDER
                     };
 
-                    if let Ok(ctx) = Context::new(window) {
-                        if let Ok(mut surface) = Surface::new(&ctx, window) {
-                            if let Ok(mut buffer) = surface.buffer_mut() {
-                                let dst = buffer.as_mut();
-                                for (i, chunk) in render_buf.chunks_exact(4).enumerate() {
-                                    if i < dst.len() {
-                                        let r = chunk[0] as u32;
-                                        let g = chunk[1] as u32;
-                                        let b = chunk[2] as u32;
-                                        let a = chunk[3] as u32;
-                                        dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
-                                    }
+                    if let Some(surface) = self.surface.as_mut() {
+                        if let Ok(mut buffer) = surface.buffer_mut() {
+                            let dst = buffer.as_mut();
+                            for (i, chunk) in render_buf.chunks_exact(4).enumerate() {
+                                if i < dst.len() {
+                                    let r = chunk[0] as u32;
+                                    let g = chunk[1] as u32;
+                                    let b = chunk[2] as u32;
+                                    let a = chunk[3] as u32;
+                                    dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
                                 }
-                                let _ = buffer.present();
                             }
+                            let _ = buffer.present();
                         }
                     }
 
@@ -278,17 +346,14 @@ mod linux_impl {
             let sz = self.display_size as f64;
             let margin = 16.0;
 
-            // Change direction every 2-5 seconds
             if now.duration_since(self.last_dir_change) > Duration::from_secs_f64(self.rng.gen_range(2.0..5.0)) {
                 self.randomize_velocity();
                 self.last_dir_change = now;
             }
 
-            // Apply velocity
             self.pos_x += self.vel_x * dt;
             self.pos_y += self.vel_y * dt;
 
-            // Bounce off edges — clamp to [margin, screen - sz - margin]
             let max_x = ((self.screen_w as f64) - sz - margin).max(margin);
             let max_y = ((self.screen_h as f64) - sz - margin).max(margin);
             let min_x = margin;
@@ -305,7 +370,6 @@ mod linux_impl {
         }
 
         fn randomize_velocity(&mut self) {
-            // Lazy drift: 40-120 px/sec in a random direction
             let speed: f64 = self.rng.gen_range(40.0..120.0);
             let angle: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
             self.vel_x = angle.cos() * speed;
@@ -325,6 +389,17 @@ mod linux_impl {
 }
 
 // ── Entry point ──
+
+#[cfg(target_os = "linux")]
+fn connect_daemon_once() -> Result<std::os::unix::net::UnixStream, String> {
+    let sock = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{dir}/gremlin.sock")
+    } else {
+        let uid = unsafe { libc::getuid() };
+        format!("/tmp/gremlin-{uid}.sock")
+    };
+    std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))
+}
 
 fn main() {
     #[cfg(not(target_os = "linux"))]

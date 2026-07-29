@@ -41,8 +41,15 @@ pub fn build_prompt(
     // Template header
     parts.push(template.system_prompt.clone());
 
-    // Context
-    let ctx_str = context.to_prompt_string();
+    // Context — the diff is included in Context::to_prompt_string() already when
+    // present, but only surface it here for templates that actually want it
+    // (code_review/bug_fix/refactor set include_diff=true; architecture/explain/
+    // documentation don't need a diff cluttering the prompt).
+    let ctx_str = if template.include_diff {
+        context.to_prompt_string()
+    } else {
+        context.to_prompt_string_without_diff()
+    };
     if !ctx_str.is_empty() {
         parts.push(format!(
             "Project context (auto-gathered, do not ask the user for this):\n{ctx_str}"
@@ -98,28 +105,52 @@ pub async fn launch(
     // (Hermes CLI may or may not support this — we try gracefully)
     cmd.env("HERMES_MODEL", &config.coding_model);
 
-    // Wait for Hermes to finish
-    #[allow(unused_mut)]
-    let mut child = cmd.spawn().map_err(|e| {
+    // Wait for Hermes to finish. We keep a handle to the child so we can kill
+    // it if the timeout below fires — otherwise a hung Hermes process would
+    // keep running in the background indefinitely after we've given up on it.
+    let child = cmd.spawn().map_err(|e| {
         GremlinError::Tool(format!("Failed to launch Hermes ({binary}): {e}"))
     })?;
+    let child_id = child.id();
 
-    // Wait with timeout
     let output = tokio::task::spawn_blocking(move || {
         child.wait_with_output()
     });
 
-    let output = tokio::time::timeout(
+    let output = match tokio::time::timeout(
         std::time::Duration::from_secs(HERMES_TIMEOUT_SECS),
         output,
     )
     .await
-    .map_err(|_| GremlinError::Tool(format!(
-        "Hermes timed out after {} seconds",
-        HERMES_TIMEOUT_SECS
-    )))?
-    .map_err(|e| GremlinError::Tool(format!("Hermes task panicked: {e}")))?
-    .map_err(|e| GremlinError::Tool(format!("Hermes process error: {e}")))?;
+    {
+        Ok(join_result) => join_result
+            .map_err(|e| GremlinError::Tool(format!("Hermes task panicked: {e}")))?
+            .map_err(|e| GremlinError::Tool(format!("Hermes process error: {e}")))?,
+        Err(_) => {
+            // Timed out — the spawn_blocking task still owns `child` and is
+            // blocked on wait_with_output(), so we can't call child.kill() on
+            // it directly anymore. Kill by PID instead so the process doesn't
+            // keep burning CPU/memory in the background after we give up.
+            let pid = child_id;
+            warn!(pid, "Hermes timed out — killing process");
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .status();
+            }
+            return Err(GremlinError::Tool(format!(
+                "Hermes timed out after {} seconds (process killed)",
+                HERMES_TIMEOUT_SECS
+            )));
+        }
+    };
 
     let duration = start.elapsed().as_secs_f64();
 

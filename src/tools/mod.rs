@@ -332,7 +332,8 @@ impl ToolRegistry {
             Box::new(|args| {
                 let prompt = args.get("prompt")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Describe what you see on the screen. Focus on code, errors, and UI elements.");
+                    .unwrap_or("Describe what you see on the screen. Focus on code, errors, and UI elements.")
+                    .to_string();
 
                 let image_bytes = crate::vision::capture_screenshot()?;
 
@@ -346,17 +347,32 @@ impl ToolRegistry {
 
                 let ollama_url = config.ollama.url.clone();
 
-                let handle = tokio::runtime::Handle::current();
-                let description = handle.block_on(crate::vision::describe_screenshot(
-                    &ollama_url,
-                    &vision_model,
-                    &image_bytes,
-                    prompt,
-                ))?;
+                // NOTE: this closure runs synchronously from inside ToolRegistry::execute(),
+                // which itself is called from within an async fn running on a tokio worker
+                // thread (daemon.rs's query() loop). Calling Handle::current().block_on(...)
+                // here would panic ("Cannot start a runtime from within a runtime"). Instead
+                // we spawn a plain OS thread with its own throwaway single-threaded runtime
+                // and block on THAT thread, which has no tokio context of its own.
+                let img_len = image_bytes.len();
+                let vision_model_for_result = vision_model.clone();
+                let description = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| GremlinError::Tool(format!("Failed to create runtime: {e}")))?;
+                    rt.block_on(crate::vision::describe_screenshot(
+                        &ollama_url,
+                        &vision_model,
+                        &image_bytes,
+                        &prompt,
+                    ))
+                })
+                .join()
+                .map_err(|_| GremlinError::Tool("Screenshot worker thread panicked".into()))??;
 
                 Ok(format!(
-                    "Screenshot ({:.1}KB) — {vision_model}:\n{description}",
-                    image_bytes.len() as f64 / 1024.0
+                    "Screenshot ({:.1}KB) — {vision_model_for_result}:\n{description}",
+                    img_len as f64 / 1024.0
                 ))
             }),
         );
@@ -384,10 +400,10 @@ impl ToolRegistry {
                 "required": ["template", "request"]
             }),
             Box::new(|args| {
-                let template_name = args["template"].as_str().unwrap_or("code_review");
-                let request = args["request"].as_str().unwrap_or("Review the code");
+                let template_name = args["template"].as_str().unwrap_or("code_review").to_string();
+                let request = args["request"].as_str().unwrap_or("Review the code").to_string();
 
-                let template = crate::hermes::find_template(template_name)
+                let template = crate::hermes::find_template(&template_name)
                     .ok_or_else(|| GremlinError::Tool(format!(
                         "Unknown template '{}'. Available: {}",
                         template_name,
@@ -403,14 +419,18 @@ impl ToolRegistry {
 
                 let context = crate::context::Context::collect(&crate::tools::ToolRegistry::new());
 
-                // Run async launch from sync context
-                let handle = tokio::runtime::Handle::current();
-                let result = handle.block_on(crate::hermes::launch(
-                    &hermes_config,
-                    &template,
-                    &context,
-                    request,
-                ))?;
+                // Same rationale as the screenshot tool above: run the async launch on a
+                // dedicated OS thread with its own runtime instead of block_on-ing the
+                // caller's (already-async) tokio worker thread.
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| GremlinError::Tool(format!("Failed to create runtime: {e}")))?;
+                    rt.block_on(crate::hermes::launch(&hermes_config, &template, &context, &request))
+                })
+                .join()
+                .map_err(|_| GremlinError::Tool("Hermes worker thread panicked".into()))??;
 
                 Ok(format!(
                     "Hermes {} (took {:.1}s):\n{}",

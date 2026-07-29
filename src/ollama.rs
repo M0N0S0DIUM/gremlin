@@ -123,10 +123,15 @@ impl Ollama {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
 
-            // Detect model-not-found from Ollama's error response
+            // Detect model-not-found from Ollama's error response. Only trust the
+            // explicit 404 status or an unambiguous "model ... not found" phrase —
+            // matching on the bare word "model" is too broad and misclassifies
+            // unrelated 500s (e.g. "Failed to load model weights", "Invalid model
+            // parameters") as ModelNotFound instead of a generic Unreachable/server
+            // error, which sends the caller down the wrong remediation path.
+            let body_lower = body.to_lowercase();
             if status.as_u16() == 404
-                || body.contains("not found")
-                || body.contains("model")
+                || (body_lower.contains("model") && body_lower.contains("not found"))
             {
                 return Err(OllamaError::ModelNotFound {
                     model: model.to_string(),

@@ -69,6 +69,33 @@ impl SpriteSheet {
             )));
         }
 
+        // Validate every state up front so downstream code (tick/current_frame)
+        // can rely on invariants instead of guarding against them everywhere:
+        // an empty `frames` list would cause `frames.len() - 1` to underflow,
+        // and `fps == 0` would divide-by-zero when computing one-shot duration.
+        for state in &meta.states {
+            if state.frames.is_empty() {
+                return Err(GremlinError::Tool(format!(
+                    "Sprite state '{}' has an empty frames list — invalid frame map",
+                    state.name
+                )));
+            }
+            if state.fps == 0 {
+                return Err(GremlinError::Tool(format!(
+                    "Sprite state '{}' has fps=0 — invalid frame map",
+                    state.name
+                )));
+            }
+            for &idx in &state.frames {
+                if idx >= meta.total_frames {
+                    return Err(GremlinError::Tool(format!(
+                        "Sprite state '{}' references frame index {} but sheet only has {} frames",
+                        state.name, idx, meta.total_frames
+                    )));
+                }
+            }
+        }
+
         // Extract frames
         let mut frames = Vec::with_capacity(meta.total_frames);
         for i in 0..meta.total_frames {
@@ -169,24 +196,32 @@ impl AnimationController {
 
     /// Advance animation based on elapsed time
     pub fn tick(&mut self) -> &Frame {
-        let state = self.sheet.state(&self.current_state).unwrap();
+        // Single lookup — with load-time validation guaranteeing every state
+        // has fps > 0 and a non-empty frames list, `- 1` / division are safe.
+        let mut state = self.sheet.state(&self.current_state)
+            .expect("current_state is only ever set to a validated state name");
         let frame_duration = Duration::from_millis((1000.0 / state.fps as f32) as u64);
         let now = Instant::now();
 
         // Handle one-shot override expiry
         if let Some(until) = self.override_until {
-            if now >= until {
-                if self.current_state != "idle" {
+            if now >= until && self.current_state != "idle" {
+                // Only fall back to "idle" if the sheet actually has that state —
+                // a custom frame map without an "idle" state would otherwise panic
+                // on the next lookup.
+                if self.sheet.state("idle").is_some() {
                     self.current_state = "idle".to_string();
                     self.frame_index = 0;
                     self.override_until = None;
                     debug!("One-shot complete, returned to idle");
+                    state = self.sheet.state(&self.current_state).unwrap();
+                } else {
+                    self.override_until = None;
                 }
             }
         }
 
         if !self.paused {
-            let state = self.sheet.state(&self.current_state).unwrap();
             while now.duration_since(self.last_update) >= frame_duration {
                 self.last_update += frame_duration;
                 self.frame_index += 1;
@@ -201,14 +236,14 @@ impl AnimationController {
             }
         }
 
-        let state = self.sheet.state(&self.current_state).unwrap();
         let global_idx = state.frames[self.frame_index];
         &self.sheet.frames[global_idx]
     }
 
     /// Get current frame without advancing time
     pub fn current_frame(&self) -> &Frame {
-        let state = self.sheet.state(&self.current_state).unwrap();
+        let state = self.sheet.state(&self.current_state)
+            .expect("current_state is only ever set to a validated state name");
         let idx = self.frame_index.min(state.frames.len() - 1);
         let global_idx = state.frames[idx];
         &self.sheet.frames[global_idx]
@@ -228,11 +263,12 @@ impl AnimationController {
     }
 
     /// Encode current frame as base64 PNG for Kitty graphics protocol
-    pub fn current_frame_base64(&self) -> String {
+    pub fn current_frame_base64(&self) -> Result<String, GremlinError> {
         let frame = self.current_frame();
         let mut buf = Vec::new();
-        frame.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png).unwrap();
-        BASE64_STANDARD.encode(&buf)
+        frame.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .map_err(|e| GremlinError::Tool(format!("PNG encode failed: {e}")))?;
+        Ok(BASE64_STANDARD.encode(&buf))
     }
 
     /// Encode specific frame as base64 PNG
@@ -371,7 +407,7 @@ pub fn register_sprite_tools(registry: &mut crate::tools::ToolRegistry, sprite_s
             Box::new(move |_args| {
                 let ctrl = system.controller.lock()
                     .map_err(|_| GremlinError::Tool("sprite controller lock poisoned".into()))?;
-                let b64 = ctrl.current_frame_base64();
+                let b64 = ctrl.current_frame_base64()?;
                 Ok(format!("data:image/png;base64,{}", b64))
             }),
         );
