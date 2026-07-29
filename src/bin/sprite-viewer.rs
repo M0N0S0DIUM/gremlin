@@ -25,7 +25,7 @@ mod linux_impl {
     };
     use softbuffer::{Context, Surface};
 
-    use super::{FRAME_SIZE, DEFAULT_SCALE};
+    use super::FRAME_SIZE;
 
     /// Connect to the Gremlin daemon's Unix socket.
     pub fn connect_daemon() -> Result<UnixStream, String> {
@@ -50,7 +50,6 @@ mod linux_impl {
         let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).ok()?;
         let body = resp["response"].as_str()?;
 
-        // Response format: "data:image/png;base64,<base64>"
         let b64 = body.strip_prefix("data:image/png;base64,")?;
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
             .ok()
@@ -83,8 +82,6 @@ mod linux_impl {
 
     pub struct App {
         window: Option<Window>,
-        context: Option<Context>,
-        surface: Option<Surface>,
         scale: u32,
         daemon_stream: Option<UnixStream>,
         last_frame: Vec<u8>,
@@ -96,8 +93,6 @@ mod linux_impl {
         pub fn new(scale: u32) -> Self {
             Self {
                 window: None,
-                context: None,
-                surface: None,
                 scale,
                 daemon_stream: None,
                 last_frame: Vec::new(),
@@ -127,13 +122,6 @@ mod linux_impl {
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create Wayland window");
-
-            // softbuffer context + surface from the winit window
-            let context = Context::new(&window).expect("failed to create softbuffer context");
-            let surface = Surface::new(&context, &window).expect("failed to create softbuffer surface");
-
-            self.context = Some(context);
-            self.surface = Some(surface);
             self.window = Some(window);
         }
 
@@ -148,6 +136,8 @@ mod linux_impl {
                     event_loop.exit();
                 }
                 WindowEvent::RedrawRequested => {
+                    let Some(window) = self.window.as_ref() else { return };
+
                     // Poll daemon ~60 Hz
                     let now = Instant::now();
                     if now.duration_since(self.last_poll) >= Duration::from_millis(16) {
@@ -159,21 +149,23 @@ mod linux_impl {
                         }
                     }
 
-                    // Render via softbuffer
+                    // Render via softbuffer (lazy per-frame — cheap at 192px)
                     if !self.last_frame.is_empty() {
-                        if let Some(ref mut surface) = self.surface {
-                            if let Ok(mut buffer) = surface.buffer_mut() {
-                                let dst = buffer.as_mut();
-                                for (i, chunk) in self.last_frame.chunks_exact(4).enumerate() {
-                                    if i < dst.len() {
-                                        let r = chunk[0] as u32;
-                                        let g = chunk[1] as u32;
-                                        let b = chunk[2] as u32;
-                                        let a = chunk[3] as u32;
-                                        dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                        if let Ok(ctx) = Context::new(window) {
+                            if let Ok(mut surface) = Surface::new(&ctx, window) {
+                                if let Ok(mut buffer) = surface.buffer_mut() {
+                                    let dst = buffer.as_mut();
+                                    for (i, chunk) in self.last_frame.chunks_exact(4).enumerate() {
+                                        if i < dst.len() {
+                                            let r = chunk[0] as u32;
+                                            let g = chunk[1] as u32;
+                                            let b = chunk[2] as u32;
+                                            let a = chunk[3] as u32;
+                                            dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                                        }
                                     }
+                                    let _ = buffer.present();
                                 }
-                                let _ = buffer.present();
                             }
                         }
                     }
