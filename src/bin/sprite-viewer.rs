@@ -192,7 +192,9 @@ mod linux_impl {
                     event_loop.exit();
                 }
                 WindowEvent::RedrawRequested => {
-                    let Some(window) = self.window.as_ref() else { return };
+                    if self.window.is_none() {
+                        return;
+                    }
 
                     let now = Instant::now();
 
@@ -208,8 +210,12 @@ mod linux_impl {
                         }
                     }
 
-                    // ── Roam: update position ──
+                    // ── Roam: update position (borrows &mut self; window re-borrowed after) ──
                     self.update_roam(now);
+
+                    let Some(window) = self.window.as_ref() else {
+                        return;
+                    };
 
                     // ── Render ──
                     let render_buf: &[u8] = if !self.last_frame.is_empty() {
@@ -273,7 +279,7 @@ mod linux_impl {
             let margin = 16.0;
 
             // Change direction every 2-5 seconds
-            if now.duration_since(self.last_dir_change) > Duration::from_secs_f64(self.rng.random_range(2.0..5.0)) {
+            if now.duration_since(self.last_dir_change) > Duration::from_secs_f64(self.rng.gen_range(2.0..5.0)) {
                 self.randomize_velocity();
                 self.last_dir_change = now;
             }
@@ -300,8 +306,8 @@ mod linux_impl {
 
         fn randomize_velocity(&mut self) {
             // Lazy drift: 40-120 px/sec in a random direction
-            let speed: f64 = self.rng.random_range(40.0..120.0);
-            let angle: f64 = self.rng.random_range(0.0..std::f64::consts::TAU);
+            let speed: f64 = self.rng.gen_range(40.0..120.0);
+            let angle: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
             self.vel_x = angle.cos() * speed;
             self.vel_y = angle.sin() * speed;
         }

@@ -6,9 +6,6 @@ use crate::error::GremlinError;
 use crate::ollama::{Message, Ollama};
 use crate::tools::{ToolRegistry, ToolResult};
 
-#[cfg(unix)]
-use tracing::error;
-
 // ── Socket path ──
 
 #[cfg(unix)]

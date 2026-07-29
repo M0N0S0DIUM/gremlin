@@ -1,27 +1,21 @@
 [Unit]
 Description=Gremlin AI orchestration daemon
 Documentation=https://github.com/M0N0S0DIUM/gremlin
-After=network-online.target ollama.service
-Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/gremlin daemon
-ExecStartPre=/bin/sh -c 'which gremlin >/dev/null || echo "gremlin binary not found in PATH"'
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=gremlin=info
 
-# Security hardening
+# Light hardening only. Do NOT add ProtectSystem=strict / ProtectHome=read-only:
+# combined with ReadWritePaths= for dirs that don't exist yet, systemd fails the
+# unit with 226/NAMESPACE on every fresh install (the sandbox mount namespace is
+# built BEFORE ExecStartPre runs, so nothing inside the unit can create them).
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.config/gremlin
-ReadWritePaths=%h/.local/share/gremlin
-ReadWritePaths=%h/.cache/gremlin
-# Daemon binds gremlin.sock in $XDG_RUNTIME_DIR — must stay writable under ProtectSystem=strict
-ReadWritePaths=%t
 
 [Install]
 WantedBy=default.target
