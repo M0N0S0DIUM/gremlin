@@ -328,6 +328,23 @@ mod unix_daemon {
         buf_reader.read_line(&mut line).await?;
 
         let request: serde_json::Value = serde_json::from_str(line.trim())?;
+
+        // ── Direct tool invocation (bypasses LLM, ~microsecond latency) ──
+        // Used by the sprite viewer and any other performance-critical consumer
+        // that needs raw tool output without going through the LLM loop.
+        if let Some(tool_name) = request["tool"].as_str() {
+            let args = request.get("args").cloned().unwrap_or(serde_json::json!({}));
+            let result = tools.execute(tool_name, args);
+            let reply = serde_json::json!({
+                "response": result.output,
+                "success": result.success
+            });
+            let mut reply_bytes = serde_json::to_vec(&reply)?;
+            reply_bytes.push(b'\n');
+            writer.write_all(&reply_bytes).await?;
+            return Ok(());
+        }
+
         let message = request["message"]
             .as_str()
             .unwrap_or("(empty)")

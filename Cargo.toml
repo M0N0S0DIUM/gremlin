@@ -19,3 +19,15 @@ dirs = "6"
 libc = "0.2"
 base64 = "0.22"
 image = "0.25"
+
+# sprite-viewer binary (Wayland window for floating sprite)
+winit = "0.30"
+softbuffer = "0.4"
+
+[[bin]]
+name = "gremlin"
+path = "src/main.rs"
+
+[[bin]]
+name = "sprite-viewer"
+path = "src/bin/sprite-viewer.rs"
