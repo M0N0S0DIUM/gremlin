@@ -170,6 +170,25 @@ async fn check() -> Result<(), GremlinError> {
     Ok(())
 }
 
+/// Resolve the sprite assets directory. The configured path (usually relative
+/// "assets/sprites") is tried as-is, then under XDG data dir, then relative to
+/// the executable — so the daemon finds sprites regardless of cwd (systemd
+/// starts us from $HOME, not the repo).
+fn resolve_sprite_dir(configured: &str) -> Option<std::path::PathBuf> {
+    const SHEET: &str = "sprite-sheet-full.png";
+    let mut candidates: Vec<std::path::PathBuf> = vec![configured.into()];
+    if let Some(data) = dirs::data_dir() {
+        candidates.push(data.join("gremlin").join(configured)); // ~/.local/share/gremlin/assets/sprites
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(configured)); // alongside binary
+            candidates.push(dir.join("../..").join(configured)); // target/release -> repo root
+        }
+    }
+    candidates.into_iter().find(|c| c.join(SHEET).exists())
+}
+
 /// Run the daemon — blocks until killed.
 async fn run_daemon() -> Result<(), GremlinError> {
     let config = Config::load()?;
@@ -179,18 +198,26 @@ async fn run_daemon() -> Result<(), GremlinError> {
     // Initialize sprite system — gracefully skip if assets are missing
     let default_sprite = crate::config::SpriteConfig::default();
     let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
-    let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
     let initial_state = &sprite_config.initial_state;
-    match SpriteSystem::new(assets_dir.to_str().unwrap_or("assets/sprites"), initial_state) {
-        Ok(sprite_system) => {
-            let sprite_system = Arc::new(sprite_system);
-            sprite_system.spawn_ticker();
-            register_sprite_tools(&mut tools, sprite_system);
-            info!("Sprite system loaded ({})", assets_dir.display());
+    match resolve_sprite_dir(&sprite_config.assets_dir) {
+        Some(assets_dir) => {
+            match SpriteSystem::new(assets_dir.to_str().unwrap_or("assets/sprites"), initial_state) {
+                Ok(sprite_system) => {
+                    let sprite_system = Arc::new(sprite_system);
+                    sprite_system.spawn_ticker();
+                    register_sprite_tools(&mut tools, sprite_system);
+                    info!("Sprite system loaded ({})", assets_dir.display());
+                }
+                Err(e) => {
+                    info!("Sprite system skipped — failed to load {}: {e}", assets_dir.display());
+                }
+            }
         }
-        Err(e) => {
-            info!("Sprite system skipped — assets not found at {}: {e}", assets_dir.display());
-            info!("Run `gremlin generate-sprites` to create sprite assets, or place them manually.");
+        None => {
+            info!(
+                "Sprite system skipped — '{}' not found (tried cwd, ~/.local/share/gremlin, exe dir)",
+                sprite_config.assets_dir
+            );
         }
     }
 
@@ -226,13 +253,14 @@ async fn ask(message: &str) -> Result<(), GremlinError> {
     // Initialize sprite system for one-shot mode too (graceful skip if assets missing)
     let default_sprite = crate::config::SpriteConfig::default();
     let sprite_config = config.sprite.as_ref().unwrap_or(&default_sprite);
-    let assets_dir = std::path::PathBuf::from(&sprite_config.assets_dir);
     let initial_state = &sprite_config.initial_state;
-    if let Ok(sprite_system) = SpriteSystem::new(
-        assets_dir.to_str().unwrap_or("assets/sprites"),
-        initial_state,
-    ) {
-        register_sprite_tools(&mut tools, Arc::new(sprite_system));
+    if let Some(assets_dir) = resolve_sprite_dir(&sprite_config.assets_dir) {
+        if let Ok(sprite_system) = SpriteSystem::new(
+            assets_dir.to_str().unwrap_or("assets/sprites"),
+            initial_state,
+        ) {
+            register_sprite_tools(&mut tools, Arc::new(sprite_system));
+        }
     }
 
     info!("Asking: {}", message);

@@ -32,6 +32,8 @@ mod linux_impl {
     use super::FRAME_SIZE;
 
     /// Connect to the Gremlin daemon's Unix socket.
+    /// Retries with backoff for up to ~60s — at login the daemon (systemd)
+    /// may still be starting when Hyprland's exec-once launches us.
     pub fn connect_daemon() -> Result<UnixStream, String> {
         let sock = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
             format!("{dir}/gremlin.sock")
@@ -39,7 +41,19 @@ mod linux_impl {
             let uid = unsafe { libc::getuid() };
             format!("/tmp/gremlin-{uid}.sock")
         };
-        UnixStream::connect(&sock).map_err(|e| format!("cannot connect to {sock}: {e}"))
+        let mut delay = std::time::Duration::from_millis(500);
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match UnixStream::connect(&sock) {
+                Ok(s) => return Ok(s),
+                Err(e) if Instant::now() < deadline => {
+                    eprintln!("sprite-viewer: waiting for daemon at {sock} ({e}), retrying...");
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                }
+                Err(e) => return Err(format!("cannot connect to {sock} after 60s: {e}")),
+            }
+        }
     }
 
     /// Call `sprite_current_frame` directly on the daemon (bypasses LLM).

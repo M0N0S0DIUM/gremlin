@@ -1,91 +1,99 @@
 #!/usr/bin/env bash
 # setup-autostart.sh — configure Gremlin to start automatically on login.
 #
-# Daemon:   systemd user service (survives logouts, starts before Hyprland)
-# Sprite:   Hyprland exec-once (needs Wayland session)
-# Window:   Hyprland windowrule (float/pin/noborder)
+# Installs:  gremlin + sprite-viewer binaries → ~/.cargo/bin
+#            sprite assets → ~/.local/share/gremlin/assets/sprites
+# Daemon:    systemd user service (auto-restarts, ordered after network)
+# Sprite:    Hyprland exec-once (retries daemon connection for 60s)
+# Window:    Hyprland windowrule (float/pin/noborder)
 #
-# Safe to run multiple times — idempotent. Pass --dry-run to preview.
+# Idempotent — safe to run repeatedly. Pass --dry-run to preview.
 
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 DRY_RUN=false; [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
 
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BIN_DIR="${HOME}/.cargo/bin"
+DATA_DIR="${HOME}/.local/share/gremlin"
 HYPR_CONF="${HOME}/.config/hypr/hyprland.conf"
-SPRITE_VIEWER="${HOME}/.cargo/bin/sprite-viewer"
 WINDOWRULE='windowrule = match:class ^(gremlin-sprite)$, float on, pin on, noborder on, noshadow on, nofocus on, noanim on, size 192 192, move 100%-220 100%-220'
-EXEC_ONCE="exec-once = ${SPRITE_VIEWER} 4"
+EXEC_ONCE="exec-once = ${BIN_DIR}/sprite-viewer 4"
 
 ok()  { echo -e "${GREEN}✓${NC} $1"; }
 warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
 err() { echo -e "${RED}✗${NC} $1"; exit 1; }
+run() { $DRY_RUN || "$@"; }
 
 echo "=== Gremlin autostart setup ==="
 $DRY_RUN && echo "(dry run — no changes)"
 
-# ── 1. Build binaries if missing ──
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-if [ ! -x "${SPRITE_VIEWER}" ]; then
-    echo "Building sprite-viewer..."
-    if ! $DRY_RUN; then
-        (cd "$REPO" && cargo build --release --bin sprite-viewer) || err "build failed"
-        mkdir -p "$(dirname "$SPRITE_VIEWER")"
-        cp "$REPO/target/release/sprite-viewer" "$SPRITE_VIEWER"
-    fi
-    ok "sprite-viewer → ${SPRITE_VIEWER}"
+# ── 0. Sanity: repo has what we need ──
+[ -f "$REPO/Cargo.toml" ] || err "run from the gremlin repo: ./scripts/setup-autostart.sh"
+[ -f "$REPO/assets/sprites/sprite-sheet-full.png" ] || err "sprite assets missing in repo"
+
+# ── 1. Build + install binaries ──
+echo "Building release binaries..."
+run bash -c "cd '$REPO' && cargo build --release" || err "build failed"
+run mkdir -p "$BIN_DIR"
+run cp -f "$REPO/target/release/gremlin" "$BIN_DIR/"
+run cp -f "$REPO/target/release/sprite-viewer" "$BIN_DIR/"
+ok "binaries → ${BIN_DIR}/{gremlin,sprite-viewer}"
+
+# ── 2. Install sprite assets where the daemon finds them from systemd ──
+#     (daemon resolves: cwd → ~/.local/share/gremlin/<path> → exe dir)
+run mkdir -p "$DATA_DIR/assets/sprites"
+run cp -f "$REPO/assets/sprites/sprite-sheet-full.png" \
+          "$REPO/assets/sprites/sprite-sheet-frame-map.json" \
+          "$DATA_DIR/assets/sprites/"
+ok "sprite assets → ${DATA_DIR}/assets/sprites"
+
+# ── 3. Config exists? ──
+if [ ! -f "${HOME}/.config/gremlin/config.toml" ]; then
+    echo "Initializing config..."
+    run "$BIN_DIR/gremlin" init || warn "gremlin init failed — run manually"
+    ok "config created (~/.config/gremlin/config.toml)"
 else
-    ok "sprite-viewer found at ${SPRITE_VIEWER}"
+    ok "config exists"
 fi
 
-# ── 2. systemd daemon service ──
+# ── 4. systemd daemon service ──
 if systemctl --user is-enabled gremlin.service &>/dev/null; then
-    ok "gremlin.service already enabled"
+    ok "gremlin.service already enabled — restarting to pick up new binary"
+    run systemctl --user restart gremlin.service
 else
     echo "Installing gremlin systemd service..."
-    if ! $DRY_RUN; then
-        gremlin service install || err "gremlin service install failed"
-    fi
-    ok "gremlin.service installed + enabled"
+    run "$BIN_DIR/gremlin" service install || err "gremlin service install failed"
+    ok "gremlin.service installed + started"
 fi
 
-# ── 3. Hyprland windowrule ──
+# ── 5. Hyprland windowrule + exec-once ──
 if [ ! -f "$HYPR_CONF" ]; then
-    warn "${HYPR_CONF} not found — skipping Hyprland rules"
+    warn "${HYPR_CONF} not found — add manually:"
+    echo "    $WINDOWRULE"
+    echo "    $EXEC_ONCE"
 else
     if grep -qF 'gremlin-sprite' "$HYPR_CONF"; then
         ok "windowrule already in hyprland.conf"
     else
-        echo "Adding windowrule to hyprland.conf..."
-        if ! $DRY_RUN; then
-            echo "" >> "$HYPR_CONF"
-            echo "# Gremlin sprite — borderless floating mascot" >> "$HYPR_CONF"
-            echo "$WINDOWRULE" >> "$HYPR_CONF"
-        fi
+        run bash -c "printf '\n# Gremlin sprite — borderless floating mascot\n%s\n' '$WINDOWRULE' >> '$HYPR_CONF'"
         ok "windowrule added"
     fi
-fi
-
-# ── 4. Hyprland exec-once for sprite-viewer ──
-if [ ! -f "$HYPR_CONF" ]; then
-    : # already warned
-elif grep -qF 'sprite-viewer' "$HYPR_CONF"; then
-    ok "exec-once for sprite-viewer already in hyprland.conf"
-else
-    echo "Adding exec-once to hyprland.conf..."
-    if ! $DRY_RUN; then
-        echo "$EXEC_ONCE" >> "$HYPR_CONF"
+    if grep -qF 'sprite-viewer' "$HYPR_CONF"; then
+        ok "exec-once already in hyprland.conf"
+    else
+        run bash -c "printf '%s\n' '$EXEC_ONCE' >> '$HYPR_CONF'"
+        ok "exec-once added"
     fi
-    ok "exec-once added"
 fi
 
 echo ""
 echo "=== Done ==="
-echo "Daemon:  systemctl --user status gremlin"
-echo "Sprite:  starts with Hyprland (reload or re-login)"
-echo "Logs:    journalctl --user -u gremlin -f"
+echo "Daemon:   systemctl --user status gremlin"
+echo "Logs:     journalctl --user -u gremlin -f"
+echo "Sprite:   hyprctl reload   (or re-login) — viewer waits up to 60s for the daemon"
+echo "Test:     gremlin ask \"hello\""
 
-if $DRY_RUN; then
-    echo ""
-    warn "dry run — no changes made. Run without --dry-run to apply."
-fi
+$DRY_RUN && { echo ""; warn "dry run — no changes made"; }
+exit 0

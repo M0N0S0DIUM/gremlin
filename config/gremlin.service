@@ -20,6 +20,8 @@ ProtectHome=read-only
 ReadWritePaths=%h/.config/gremlin
 ReadWritePaths=%h/.local/share/gremlin
 ReadWritePaths=%h/.cache/gremlin
+# Daemon binds gremlin.sock in $XDG_RUNTIME_DIR — must stay writable under ProtectSystem=strict
+ReadWritePaths=%t
 
 [Install]
 WantedBy=default.target
