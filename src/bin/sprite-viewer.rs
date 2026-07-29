@@ -1,6 +1,7 @@
 //! sprite-viewer — borderless floating Wayland window that polls the Gremlin
 //! daemon for the current sprite animation frame and renders it at 4x scale.
 //! Roams the screen with a lazy random walk — desktop pet behaviour.
+//! Left-click opens a zenity/rofi/wofi dialog to ask Gremlin a question.
 //!
 //! Linux/Wayland only.  Usage:
 //!   ./target/release/sprite-viewer [scale_factor]
@@ -16,14 +17,16 @@ const DEFAULT_SCALE: u32 = 4;
 mod linux_impl {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::process::Command;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use rand::Rng;
     use winit::{
         application::ApplicationHandler,
         dpi::{PhysicalPosition, PhysicalSize},
-        event::WindowEvent,
+        event::{MouseButton, WindowEvent},
         event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
         platform::wayland::WindowAttributesExtWayland,
         window::{Window, WindowAttributes, WindowId},
@@ -31,6 +34,23 @@ mod linux_impl {
     use softbuffer::{Context, Surface};
 
     use super::FRAME_SIZE;
+
+    // ── Socket connection with retry ──
+
+    /// Try to connect to the daemon socket once.
+    fn try_connect_once() -> Result<UnixStream, String> {
+        let sock = socket_path();
+        UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))
+    }
+
+    fn socket_path() -> String {
+        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+            format!("{dir}/gremlin.sock")
+        } else {
+            let uid = unsafe { libc::getuid() };
+            format!("/tmp/gremlin-{uid}.sock")
+        }
+    }
 
     /// Connect to the Gremlin daemon's Unix socket.
     /// Retries with backoff for up to ~60s — at login the daemon (systemd)
@@ -51,19 +71,12 @@ mod linux_impl {
         }
     }
 
-    fn socket_path() -> String {
-        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            format!("{dir}/gremlin.sock")
-        } else {
-            let uid = unsafe { libc::getuid() };
-            format!("/tmp/gremlin-{uid}.sock")
-        }
+    /// Connect without retry — used for reconnection after a poll failure.
+    fn connect_daemon_once() -> Result<UnixStream, String> {
+        try_connect_once()
     }
 
-    fn try_connect_once() -> Result<UnixStream, String> {
-        let sock = socket_path();
-        UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))
-    }
+    // ── Daemon protocol ──
 
     /// Call `sprite_current_frame` directly on the daemon (bypasses LLM).
     /// Reads the full response by looping until a newline is seen or the
@@ -128,16 +141,104 @@ mod linux_impl {
         dst
     }
 
+    // ── Dialog subsystem ──
+
+    /// Available dialog backends, in priority order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DialogBackend {
+        Zenity,
+        Rofi,
+        Wofi,
+    }
+
+    impl DialogBackend {
+        /// Detect the first available backend on the system.
+        fn detect() -> Option<Self> {
+            if command_exists("zenity") {
+                return Some(Self::Zenity);
+            }
+            if command_exists("rofi") {
+                return Some(Self::Rofi);
+            }
+            if command_exists("wofi") {
+                return Some(Self::Wofi);
+            }
+            None
+        }
+
+        /// Show an entry dialog, return the user's input (trimmed).
+        fn entry(&self, title: &str, prompt: &str) -> Option<String> {
+            let args: Vec<&str> = match self {
+                Self::Zenity => vec!["--entry", "--title", title, "--text", prompt, "--width=400"],
+                Self::Rofi => vec!["-dmenu", "-p", prompt, "-theme-str", "window {width: 400;}"],
+                Self::Wofi => vec!["--dmenu", "-p", prompt, "--width", "400"],
+            };
+            let output = Command::new(self.cmd()).args(args).output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+        }
+
+        /// Show an info dialog with the response.
+        fn info(&self, title: &str, text: &str) -> bool {
+            let args: Vec<&str> = match self {
+                Self::Zenity => vec!["--info", "--title", title, "--text", text, "--width=500"],
+                Self::Rofi => vec!["-e", "-no-fixed-num-lines", "-theme-str", "window {width: 500;}"],
+                Self::Wofi => vec!["--show", "dmenu", "-p", title],
+            };
+            let mut child = match Command::new(self.cmd())
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                if stdin.write_all(text.as_bytes()).is_err() {
+                    return false;
+                }
+            }
+            child.wait().map(|s| s.success()).unwrap_or(false)
+        }
+
+        fn cmd(&self) -> &'static str {
+            match self {
+                Self::Zenity => "zenity",
+                Self::Rofi => "rofi",
+                Self::Wofi => "wofi",
+            }
+        }
+    }
+
+    fn command_exists(cmd: &str) -> bool {
+        Command::new("which").arg(cmd).output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// Send a message to the daemon and return the response text.
+    fn ask_daemon(daemon_stream: &mut UnixStream, question: &str) -> Option<String> {
+        let req = serde_json::json!({"message": question});
+        let mut req_bytes = serde_json::to_vec(&req).ok()?;
+        req_bytes.push(b'\n');
+        daemon_stream.write_all(&req_bytes).ok()?;
+
+        let mut buf = [0u8; 65536];
+        let n = daemon_stream.read(&mut buf).ok()?;
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).ok()?;
+        resp["response"].as_str().map(|s| s.to_string())
+    }
+
+    // ── Main application ──
+
     pub struct App {
         window: Option<Rc<Window>>,
-        // Created once in `resumed()` and reused every frame — softbuffer 0.4's
-        // Context/Surface are generic over the window handle type, but that
-        // becomes a *nameable, storable* type once the handle is an owned Rc
-        // (rather than a borrow with an awkward self-referential lifetime), so
-        // there's no need to reconstruct these ~60 times/sec.
         surface: Option<Surface<Rc<Window>, Rc<Window>>>,
         scale: u32,
-        daemon_stream: Option<UnixStream>,
+        daemon_stream: Arc<Mutex<Option<UnixStream>>>,
         last_frame: Vec<u8>,
         last_poll: Instant,
         last_reconnect_attempt: Instant,
@@ -151,15 +252,22 @@ mod linux_impl {
         screen_w: u32,
         screen_h: u32,
         rng: rand::rngs::ThreadRng,
+        // ── dialog state ──
+        dialog_backend: Option<DialogBackend>,
+        dialog_active: Arc<Mutex<bool>>, // prevents re-entrant dialogs
     }
 
     impl App {
         pub fn new(scale: u32) -> Self {
+            let dialog_backend = DialogBackend::detect();
+            if dialog_backend.is_none() {
+                eprintln!("sprite-viewer: no dialog backend found (zenity/rofi/wofi not in PATH); click-to-ask disabled");
+            }
             Self {
                 window: None,
                 surface: None,
                 scale,
-                daemon_stream: None,
+                daemon_stream: Arc::new(Mutex::new(None)),
                 last_frame: Vec::new(),
                 last_poll: Instant::now(),
                 last_reconnect_attempt: Instant::now(),
@@ -172,11 +280,13 @@ mod linux_impl {
                 screen_w: 1920,
                 screen_h: 1080,
                 rng: rand::thread_rng(),
+                dialog_backend: DialogBackend::detect(),
+                dialog_active: Arc::new(Mutex::new(false)),
             }
         }
 
         pub fn set_daemon_stream(&mut self, stream: UnixStream) {
-            self.daemon_stream = Some(stream);
+            *self.daemon_stream.lock().unwrap() = Some(stream);
         }
     }
 
@@ -200,6 +310,8 @@ mod linux_impl {
             );
 
             // Create the softbuffer Context+Surface once here, not per frame.
+            // softbuffer 0.4's Context/Surface are generic over the window handle type;
+            // with an owned Rc<Window> the types become nameable and storable.
             match Context::new(window.clone()) {
                 Ok(ctx) => match Surface::new(&ctx, window.clone()) {
                     Ok(surface) => self.surface = Some(surface),
@@ -251,14 +363,16 @@ mod linux_impl {
                     if now.duration_since(self.last_poll) >= Duration::from_millis(16) {
                         self.last_poll = now;
                         let mut poll_failed = false;
-                        if let Some(stream) = self.daemon_stream.as_mut() {
-                            match poll_frame(stream) {
-                                Some(data) => {
-                                    if let Some((rgba, w, h)) = decode_png(&data) {
-                                        self.last_frame = scale_nearest(&rgba, w, h, self.scale);
+                        if let Ok(mut guard) = self.daemon_stream.try_lock() {
+                            if let Some(stream) = guard.as_mut() {
+                                match poll_frame(stream) {
+                                    Some(data) => {
+                                        if let Some((rgba, w, h)) = decode_png(&data) {
+                                            self.last_frame = scale_nearest(&rgba, w, h, self.scale);
+                                        }
                                     }
+                                    None => poll_failed = true,
                                 }
-                                None => poll_failed = true,
                             }
                         }
                         // If the daemon connection died (restarted, socket closed),
@@ -268,20 +382,15 @@ mod linux_impl {
                             && now.duration_since(self.last_reconnect_attempt) >= Duration::from_secs(2)
                         {
                             self.last_reconnect_attempt = now;
-                            self.daemon_stream = None;
-                            match super::connect_daemon_once() {
-                                Ok(stream) => {
-                                    eprintln!("sprite-viewer: reconnected to daemon");
-                                    self.daemon_stream = Some(stream);
-                                }
-                                Err(e) => {
-                                    eprintln!("sprite-viewer: reconnect failed ({e}), will retry");
-                                }
+                            *self.daemon_stream.lock().unwrap() = None;
+                            if let Ok(stream) = connect_daemon_once() {
+                                eprintln!("sprite-viewer: reconnected to daemon");
+                                *self.daemon_stream.lock().unwrap() = Some(stream);
                             }
                         }
                     }
 
-                    // ── Roam: update position (borrows &mut self; window re-borrowed after) ──
+                    // ── Roam: update position ──
                     self.update_roam(now);
 
                     let Some(window) = self.window.as_ref() else {
@@ -334,26 +443,73 @@ mod linux_impl {
 
                     window.request_redraw();
                 }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if state.is_pressed() && button == MouseButton::Left {
+                        self.handle_click();
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     impl App {
+        /// Handle left-click: show entry dialog → send to daemon → show response.
+        fn handle_click(&self) {
+            // Prevent re-entrant dialogs (double-click, rapid clicks, etc.)
+            let mut active = self.dialog_active.lock().unwrap();
+            if *active {
+                return;
+            }
+            *active = true;
+            drop(active); // release lock before spawning
+
+            let backend = match self.dialog_backend {
+                Some(b) => b,
+                None => return, // no backend available
+            };
+
+            let daemon_stream = Arc::clone(&self.daemon_stream);
+            let active_flag = Arc::clone(&self.dialog_active);
+
+            std::thread::spawn(move || {
+                let _guard = DialogGuard(&active_flag);
+
+                // 1) Show entry dialog
+                let question = match backend.entry("Gremlin", "Ask me anything...") {
+                    Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+                    _ => return, // cancelled or empty
+                };
+
+                // 2) Send to daemon
+                let response = {
+                    let mut guard = daemon_stream.lock().unwrap();
+                    guard.as_mut().and_then(|s| ask_daemon(s, &question))
+                };
+
+                // 3) Show response
+                let response = response.unwrap_or_else(|| "No response from daemon.".to_string());
+                let _ = backend.info("Gremlin", &response);
+            });
+        }
+
         /// Advance the roaming position one tick, bouncing off screen edges.
         fn update_roam(&mut self, now: Instant) {
             let dt = 0.016; // ~60fps tick
             let sz = self.display_size as f64;
             let margin = 16.0;
 
+            // Change direction every 2-5 seconds
             if now.duration_since(self.last_dir_change) > Duration::from_secs_f64(self.rng.gen_range(2.0..5.0)) {
                 self.randomize_velocity();
                 self.last_dir_change = now;
             }
 
+            // Apply velocity
             self.pos_x += self.vel_x * dt;
             self.pos_y += self.vel_y * dt;
 
+            // Bounce off edges — clamp to [margin, screen - sz - margin]
             let max_x = ((self.screen_w as f64) - sz - margin).max(margin);
             let max_y = ((self.screen_h as f64) - sz - margin).max(margin);
             let min_x = margin;
@@ -374,6 +530,14 @@ mod linux_impl {
             let angle: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
             self.vel_x = angle.cos() * speed;
             self.vel_y = angle.sin() * speed;
+        }
+    }
+
+    // RAII guard to reset the dialog_active flag when the thread exits.
+    struct DialogGuard<'a>(&'a Mutex<bool>);
+    impl<'a> Drop for DialogGuard<'a> {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = false;
         }
     }
 
