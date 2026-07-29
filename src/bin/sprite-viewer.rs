@@ -116,11 +116,13 @@ mod linux_impl {
             let attrs = WindowAttributes::default()
                 .with_inner_size(PhysicalSize::new(sz, sz))
                 .with_title("gremlin-sprite")
-                .with_name("gremlin-sprite", "gremlin-sprite");
+                .with_name("gremlin-sprite", "gremlin-sprite")
+                .with_visible(true);
 
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create Wayland window");
+            eprintln!("sprite-viewer: window created {}×{}", sz, sz);
             window.request_redraw();
             self.window = Some(window);
         }
@@ -145,11 +147,18 @@ mod linux_impl {
                         if let Some(data) = poll_frame(self.daemon_stream.as_mut().unwrap()) {
                             if let Some((rgba, w, h)) = decode_png(&data) {
                                 self.last_frame = scale_nearest(&rgba, w, h, self.scale);
+                                static mut FIRST: bool = true;
+                                unsafe {
+                                    if FIRST {
+                                        eprintln!("sprite-viewer: first frame received ({}×{})", w, h);
+                                        FIRST = false;
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Render via softbuffer (lazy per-frame — cheap at 192px)
+                    // Render
                     if !self.last_frame.is_empty() {
                         if let Ok(ctx) = Context::new(window) {
                             if let Ok(mut surface) = Surface::new(&ctx, window) {
@@ -169,6 +178,9 @@ mod linux_impl {
                             }
                         }
                     }
+
+                    // Chain next redraw to keep the loop alive
+                    window.request_redraw();
                 }
                 _ => {}
             }
