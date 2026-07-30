@@ -96,7 +96,7 @@ Gremlin has 25 built-in tools across 8 categories:
 
 ## Sprite Viewer (Hyprland Window Rules)
 
-The sprite-viewer (`gremlin-sprite`) renders Gremlin as a floating desktop mascot via Wayland. Add these rules to your `~/.config/hypr/hyprland.conf`:
+The sprite-viewer (`gremlin-sprite`) renders Gremlin as a floating desktop mascot via Wayland. On Hyprland, it uses the compositor's IPC socket to roam; it remains stationary on other Wayland compositors because Wayland does not permit clients to set their own window position. Add these rules to your `~/.config/hypr/hyprland.conf`:
 
 ```ini
 # Gremlin sprite — borderless floating mascot window (Hyprland ≥ 0.53)

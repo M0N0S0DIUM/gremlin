@@ -16,6 +16,8 @@ const DEFAULT_SCALE: u32 = 4;
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::num::NonZeroU32;
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::rc::Rc;
@@ -50,6 +52,31 @@ mod linux_impl {
             let uid = unsafe { libc::getuid() };
             format!("/tmp/gremlin-{uid}.sock")
         }
+    }
+
+    /// Send a single position update to Hyprland's command socket.  Wayland
+    /// intentionally does not let clients position their own windows, so
+    /// winit's `set_outer_position` is a no-op there.  Hyprland's IPC is the
+    /// compositor-approved path for moving this explicitly floating window.
+    fn move_sprite_with_hyprland(x: f64, y: f64) -> Result<(), String> {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .map_err(|_| "XDG_RUNTIME_DIR is not set".to_string())?;
+        let instance = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+            .map_err(|_| "HYPRLAND_INSTANCE_SIGNATURE is not set".to_string())?;
+        let socket = format!("{runtime_dir}/hypr/{instance}/.socket.sock");
+        let mut stream = UnixStream::connect(&socket)
+            .map_err(|e| format!("cannot connect to {socket}: {e}"))?;
+        let command = format!(
+            "dispatch movewindowpixel exact {} {},class:^(gremlin-sprite)$",
+            x.round() as i32,
+            y.round() as i32,
+        );
+        stream.write_all(command.as_bytes())
+            .map_err(|e| format!("cannot send Hyprland move command: {e}"))?;
+        // Hyprland processes this socket synchronously. Close it immediately
+        // instead of retaining a connection that could stall the compositor.
+        stream.shutdown(Shutdown::Both)
+            .map_err(|e| format!("cannot close Hyprland IPC socket: {e}"))
     }
 
     /// Connect to the Gremlin daemon's Unix socket.
@@ -249,6 +276,8 @@ mod linux_impl {
         vel_x: f64,
         vel_y: f64,
         last_dir_change: Instant,
+        last_compositor_move: Instant,
+        hyprland_roaming: bool,
         screen_w: u32,
         screen_h: u32,
         rng: rand::rngs::ThreadRng,
@@ -277,6 +306,8 @@ mod linux_impl {
                 vel_x: 0.0,
                 vel_y: 0.0,
                 last_dir_change: Instant::now(),
+                last_compositor_move: Instant::now() - Duration::from_secs(1),
+                hyprland_roaming: std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
                 screen_w: 1920,
                 screen_h: 1080,
                 rng: rand::thread_rng(),
@@ -314,7 +345,21 @@ mod linux_impl {
             // with an owned Rc<Window> the types become nameable and storable.
             match Context::new(window.clone()) {
                 Ok(ctx) => match Surface::new(&ctx, window.clone()) {
-                    Ok(surface) => self.surface = Some(surface),
+                    Ok(mut surface) => {
+                        // softbuffer requires an explicit non-zero buffer size before
+                        // buffer_mut(). Without this, the Wayland backend panics on the
+                        // first redraw and the sprite window never receives pixels.
+                        let size = window.inner_size();
+                        match (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                            (Some(width), Some(height)) => {
+                                if let Err(e) = surface.resize(width, height) {
+                                    eprintln!("sprite-viewer: failed to size surface: {e}");
+                                }
+                            }
+                            _ => eprintln!("sprite-viewer: window has zero-sized surface"),
+                        }
+                        self.surface = Some(surface);
+                    }
                     Err(e) => eprintln!("sprite-viewer: failed to create surface: {e}"),
                 },
                 Err(e) => eprintln!("sprite-viewer: failed to create softbuffer context: {e}"),
@@ -351,6 +396,20 @@ mod linux_impl {
             match event {
                 WindowEvent::CloseRequested => {
                     event_loop.exit();
+                }
+                WindowEvent::Resized(size) => {
+                    if let Some(surface) = self.surface.as_mut() {
+                        match (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                            (Some(width), Some(height)) => {
+                                if let Err(e) = surface.resize(width, height) {
+                                    eprintln!("sprite-viewer: failed to resize surface: {e}");
+                                }
+                            }
+                            // A minimized surface has no drawable buffer; the next
+                            // non-zero resize will reconfigure it.
+                            _ => {}
+                        }
+                    }
                 }
                 WindowEvent::RedrawRequested => {
                     if self.window.is_none() {
@@ -426,18 +485,25 @@ mod linux_impl {
                     };
 
                     if let Some(surface) = self.surface.as_mut() {
-                        if let Ok(mut buffer) = surface.buffer_mut() {
-                            let dst = buffer.as_mut();
-                            for (i, chunk) in render_buf.chunks_exact(4).enumerate() {
-                                if i < dst.len() {
-                                    let r = chunk[0] as u32;
-                                    let g = chunk[1] as u32;
-                                    let b = chunk[2] as u32;
-                                    let a = chunk[3] as u32;
-                                    dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                        match surface.buffer_mut() {
+                            Ok(mut buffer) => {
+                                let dst = buffer.as_mut();
+                                for (i, chunk) in render_buf.chunks_exact(4).enumerate() {
+                                    if i < dst.len() {
+                                        let r = chunk[0] as u32;
+                                        let g = chunk[1] as u32;
+                                        let b = chunk[2] as u32;
+                                        let a = chunk[3] as u32;
+                                        dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                                    }
+                                }
+                                if let Err(e) = buffer.present() {
+                                    eprintln!("sprite-viewer: failed to present frame: {e}");
                                 }
                             }
-                            let _ = buffer.present();
+                            Err(e) => {
+                                eprintln!("sprite-viewer: failed to acquire render buffer: {e}")
+                            }
                         }
                     }
 
@@ -520,8 +586,20 @@ mod linux_impl {
             if self.pos_y < min_y { self.pos_y = min_y; self.vel_y = self.vel_y.abs(); }
             if self.pos_y > max_y { self.pos_y = max_y; self.vel_y = -self.vel_y.abs(); }
 
-            if let Some(ref window) = self.window {
-                let _ = window.set_outer_position(PhysicalPosition::new(self.pos_x, self.pos_y));
+            if self.hyprland_roaming {
+                // Limit IPC updates to 30 Hz. Hyprland handles commands
+                // synchronously, so sending one for every 60 Hz redraw can
+                // needlessly make the compositor feel sluggish.
+                if now.duration_since(self.last_compositor_move) >= Duration::from_millis(33) {
+                    self.last_compositor_move = now;
+                    if let Err(e) = move_sprite_with_hyprland(self.pos_x, self.pos_y) {
+                        eprintln!("sprite-viewer: disabling Hyprland roaming: {e}");
+                        self.hyprland_roaming = false;
+                    }
+                }
+            } else if let Some(ref window) = self.window {
+                // Kept for X11, where clients can still position their own windows.
+                window.set_outer_position(PhysicalPosition::new(self.pos_x, self.pos_y));
             }
         }
 
@@ -553,17 +631,6 @@ mod linux_impl {
 }
 
 // ── Entry point ──
-
-#[cfg(target_os = "linux")]
-fn connect_daemon_once() -> Result<std::os::unix::net::UnixStream, String> {
-    let sock = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        format!("{dir}/gremlin.sock")
-    } else {
-        let uid = unsafe { libc::getuid() };
-        format!("/tmp/gremlin-{uid}.sock")
-    };
-    std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))
-}
 
 fn main() {
     #[cfg(not(target_os = "linux"))]
