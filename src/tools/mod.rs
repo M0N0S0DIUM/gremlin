@@ -2,13 +2,18 @@ pub mod cargo;
 pub mod clipboard;
 pub mod filesystem;
 pub mod git;
+pub mod memory;
 pub mod shell;
 pub mod system;
 
+use std::sync::Arc;
+use crate::memory::Memory;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::GremlinError;
+
+pub use crate::tools::memory::register_memory_tools;
 
 /// A tool that Gremlin can invoke — the LLM picks the tool, we execute it
 #[derive(Debug, Clone)]
@@ -34,7 +39,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, GremlinError> {
         let mut registry = Self {
             tools: Vec::new(),
             handlers: HashMap::new(),
@@ -417,7 +422,7 @@ impl ToolRegistry {
                         "Hermes is not configured. Add [hermes] section to ~/.config/gremlin/config.toml".into()
                     ))?;
 
-                let context = crate::context::Context::collect(&crate::tools::ToolRegistry::new());
+                let context = crate::context::Context::collect(&crate::tools::ToolRegistry::new()?);
 
                 // Same rationale as the screenshot tool above: run the async launch on a
                 // dedicated OS thread with its own runtime instead of block_on-ing the
@@ -441,10 +446,15 @@ impl ToolRegistry {
             }),
         );
 
-        registry
-    }
+        // Register memory tools
+        let data_dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+            .join("gremlin");
+        let memory = Arc::new(Memory::new(&data_dir)?);
+        register_memory_tools(&mut registry, memory.clone());
 
-    /// Register a new tool
+        Ok(registry)
+    }
     pub fn register(
         &mut self,
         name: &'static str,
@@ -509,7 +519,7 @@ impl ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("ToolRegistry::new() should succeed")
     }
 }
 
@@ -519,20 +529,20 @@ mod tests {
 
     #[test]
     fn test_registry_has_tools() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         assert!(registry.tools.len() >= 20, "expected >=20 tools, got {}", registry.tools.len());
     }
 
     #[test]
     fn test_pwd_tool() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         let result = registry.execute("pwd", serde_json::json!({}));
         assert!(result.success, "pwd failed: {}", result.output);
     }
 
     #[test]
     fn test_unknown_tool() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         let result = registry.execute("nope_nope", serde_json::json!({}));
         assert!(!result.success);
         assert!(result.output.contains("Unknown tool"));
@@ -540,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_all_tools_have_descriptions() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         for tool in &registry.tools {
             assert!(!tool.description.is_empty(), "tool '{}' has no description", tool.name);
         }
@@ -548,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_git_branch_handles_no_repo() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         let result = registry.execute("git_branch", serde_json::json!({}));
         // Either succeeds (in a repo) or fails with git error
         if !result.success {
@@ -558,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_list_dir_works() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         let result = registry.execute("list_dir", serde_json::json!({}));
         assert!(result.success, "list_dir failed: {}", result.output);
     }

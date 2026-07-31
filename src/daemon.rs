@@ -1,8 +1,10 @@
 use tracing::{debug, info};
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::context::Context;
 use crate::error::GremlinError;
+use crate::memory::Memory;
 use crate::ollama::{Message, Ollama};
 use crate::tools::{ToolRegistry, ToolResult};
 
@@ -472,14 +474,14 @@ mod unix_daemon {
 
 // ── Public API ──
 
-pub async fn run_daemon(config: Config, ollama: Ollama, tools: ToolRegistry) -> Result<(), GremlinError> {
+pub async fn run_daemon(config: Config, ollama: Ollama, tools: ToolRegistry, memory: Arc<Memory>) -> Result<(), GremlinError> {
     #[cfg(unix)]
     {
-        unix_daemon::run(config, ollama, tools).await
+        unix_daemon::run(config, ollama, tools, memory).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (config, ollama, tools);
+        let _ = (config, ollama, tools, memory);
         Err(GremlinError::Tool(
             "Daemon mode is only supported on Linux/Unix. Use `gremlin ask` for one-shot queries.".into(),
         ))

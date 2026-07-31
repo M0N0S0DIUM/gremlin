@@ -473,7 +473,7 @@ mod tests {
             SpriteSystem::new(test_sheet_dir().to_str().unwrap(), "idle")
                 .expect("sprite system should init"),
         );
-        let mut registry = crate::tools::ToolRegistry::new();
+        let mut registry = crate::tools::ToolRegistry::new().expect("ToolRegistry::new() should succeed");
         register_sprite_tools(&mut registry, system);
 
         // Directly exercises sprite_state's closure from within this async

@@ -19,7 +19,7 @@ use crate::error::GremlinError;
 use crate::memory::Memory;
 use crate::ollama::Ollama;
 use crate::sprite::{register_sprite_tools, SpriteSystem};
-use crate::tools::ToolRegistry;
+use crate::tools::{register_memory_tools, ToolRegistry};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -195,7 +195,15 @@ fn resolve_sprite_dir(configured: &str) -> Option<std::path::PathBuf> {
 async fn run_daemon() -> Result<(), GremlinError> {
     let config = Config::load()?;
     let ollama = Ollama::new(&config.ollama);
-    let mut tools = ToolRegistry::new();
+
+    // Initialize memory system
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+        .join("gremlin");
+    let memory = Arc::new(Memory::new(&data_dir)?);
+
+    let mut tools = ToolRegistry::new()?;
+    register_memory_tools(&mut tools, memory.clone());
 
     // Initialize sprite system — gracefully skip if assets are missing
     let default_sprite = crate::config::SpriteConfig::default();
@@ -231,7 +239,7 @@ async fn run_daemon() -> Result<(), GremlinError> {
 
     info!("Ollama connected. Model: {}", config.model.name);
 
-    daemon::run_daemon(config, ollama, tools).await
+    daemon::run_daemon(config, ollama, tools, memory).await
 }
 
 /// Ask Gremlin — tries the daemon first, falls back to one-shot mode.
@@ -250,7 +258,15 @@ async fn ask(message: &str) -> Result<(), GremlinError> {
 
     let config = Config::load()?;
     let ollama = Ollama::new(&config.ollama);
-    let mut tools = ToolRegistry::new();
+
+    // Initialize memory system
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+        .join("gremlin");
+    let memory = Arc::new(Memory::new(&data_dir)?);
+
+    let mut tools = ToolRegistry::new()?;
+    register_memory_tools(&mut tools, memory.clone());
 
     // Initialize sprite system for one-shot mode too (graceful skip if assets missing)
     let default_sprite = crate::config::SpriteConfig::default();
