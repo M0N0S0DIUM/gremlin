@@ -1,4 +1,4 @@
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -341,7 +341,7 @@ mod unix_daemon {
 
     use super::*;
 
-    pub async fn run(config: Config, ollama: Ollama, tools: ToolRegistry) -> Result<(), GremlinError> {
+    pub async fn run(config: Config, ollama: Ollama, tools: ToolRegistry, memory: Arc<Memory>) -> Result<(), GremlinError> {
         let path = socket_path();
 
         if path.exists() {
