@@ -494,6 +494,10 @@ mod linux_impl {
                                         let g = chunk[1] as u32;
                                         let b = chunk[2] as u32;
                                         let a = chunk[3] as u32;
+                                        // Premultiply alpha for correct compositing on Wayland
+                                        let r = (r * a + 127) / 255;
+                                        let g = (g * a + 127) / 255;
+                                        let b = (b * a + 127) / 255;
                                         dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
                                     }
                                 }
