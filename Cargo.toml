@@ -27,7 +27,8 @@ rusqlite = { version = "0.31", features = ["bundled", "vtab", "functions", "load
 
 # sprite-viewer binary (Wayland window for floating sprite)
 winit = "0.30"
-softbuffer = "0.4"
+wgpu = "22"
+pollster = "0.3"
 rand = "0.8"
 
 [[bin]]
