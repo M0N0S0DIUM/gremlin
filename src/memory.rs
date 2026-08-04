@@ -1,8 +1,8 @@
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::error::GremlinError;
 
@@ -310,7 +310,7 @@ impl Memory {
     /// Full-text search over conversations
     pub fn search(&self, query: &str, project: Option<&str>, limit: usize) -> Result<Vec<StoredMessage>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(proj) = project {
+        if let Some(_proj) = project {
             let mut stmt = conn.prepare(
                 "SELECT c.id, c.session_id, c.role, c.content, c.project, c.tokens, c.created_at
                  FROM conversations_fts f
@@ -360,7 +360,7 @@ impl Memory {
     /// Get or create a fact
     pub fn upsert_fact(&self, key: &str, value: &str, project: Option<&str>, confidence: f32, source: &str) -> Result<i64, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
+        let _now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"
             INSERT INTO facts (key, value, project, confidence, source, created_at, updated_at)
@@ -378,7 +378,7 @@ impl Memory {
 
     pub fn get_fact(&self, key: &str, project: Option<&str>) -> Result<Option<Fact>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(p) = project {
+        if let Some(_p) = project {
             let mut stmt = conn.prepare(
                 "SELECT id, key, value, project, confidence, source, created_at, updated_at FROM facts WHERE key = ? AND project = ?"
             )?;
@@ -417,7 +417,7 @@ impl Memory {
 
     pub fn list_facts(&self, project: Option<&str>) -> Result<Vec<Fact>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(p) = project {
+        if let Some(_p) = project {
             let mut stmt = conn.prepare(
                 "SELECT id, key, value, project, confidence, source, created_at, updated_at FROM facts WHERE project = ? ORDER BY confidence DESC"
             )?;
@@ -475,7 +475,7 @@ impl Memory {
 
     pub fn get_preference(&self, key: &str, project: Option<&str>) -> Result<Option<Preference>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(p) = project {
+        if let Some(_p) = project {
             let mut stmt = conn.prepare(
                 "SELECT id, key, value, project, confidence, source, created_at, updated_at FROM preferences WHERE key = ? AND project = ?"
             )?;
@@ -514,7 +514,7 @@ impl Memory {
 
     pub fn list_preferences(&self, project: Option<&str>) -> Result<Vec<Preference>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(p) = project {
+        if let Some(_p) = project {
             let mut stmt = conn.prepare(
                 "SELECT id, key, value, project, confidence, source, created_at, updated_at FROM preferences WHERE project = ? ORDER BY confidence DESC"
             )?;
@@ -605,7 +605,7 @@ impl Memory {
 
     pub fn get_self_modifications(&self, status: Option<&str>) -> Result<Vec<SelfModification>, GremlinError> {
         let conn = self.conn.lock().unwrap();
-        if let Some(s) = status {
+        if let Some(_s) = status {
             let mut stmt = conn.prepare(
                 "SELECT id, kind, title, description, diff, confidence, status, created_at, decided_at FROM self_modifications WHERE status = ? ORDER BY created_at DESC"
             )?;
