@@ -322,8 +322,7 @@ mod linux_impl {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            }))
-            .ok()?;
+            }))?;
             let (device, queue) = pollster::block_on(adapter.request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("gremlin-sprite-device"),
@@ -521,14 +520,14 @@ mod linux_impl {
                 self.tex_size = (w, h);
             }
             self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
+                wgpu::ImageCopyTexture {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 rgba,
-                wgpu::TexelCopyBufferLayout {
+                wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * w),
                     rows_per_image: Some(h),
