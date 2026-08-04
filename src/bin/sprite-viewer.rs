@@ -852,7 +852,11 @@ mod linux_impl {
 
             let backend = match self.dialog_backend {
                 Some(b) => b,
-                None => return, // no backend available
+                None => {
+                    eprintln!("sprite-viewer: no dialog backend available (install zenity/rofi/wofi)");
+                    *self.dialog_active.lock().unwrap() = false;
+                    return;
+                }
             };
 
             let daemon_stream = Arc::clone(&self.daemon_stream);
@@ -864,8 +868,13 @@ mod linux_impl {
                 // 1) Show entry dialog
                 let question = match backend.entry("Gremlin", "Ask me anything...") {
                     Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-                    _ => return, // cancelled or empty
+                    _ => {
+                        eprintln!("sprite-viewer: dialog cancelled or empty input");
+                        return;
+                    }
                 };
+
+                eprintln!("sprite-viewer: sending question to daemon: {}", question);
 
                 // 2) Send to daemon
                 let response = {
@@ -874,8 +883,23 @@ mod linux_impl {
                 };
 
                 // 3) Show response
-                let response = response.unwrap_or_else(|| "No response from daemon.".to_string());
-                let _ = backend.info("Gremlin", &response);
+                let response = match response {
+                    Some(r) => {
+                        eprintln!("sprite-viewer: got response ({} chars)", r.len());
+                        r
+                    }
+                    None => {
+                        eprintln!("sprite-viewer: daemon returned no response");
+                        "No response from daemon.".to_string()
+                    }
+                };
+
+                // Try to show response; if it fails, log it so we know
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.info("Gremlin", &response)
+                })) {
+                    eprintln!("sprite-viewer: dialog backend info() panicked: {:?}", e);
+                }
             });
         }
 
@@ -938,11 +962,17 @@ mod linux_impl {
         }
 
         fn randomize_velocity(&mut self) {
-            let speed: f64 = self.rng.gen_range(40.0..120.0);
-            let angle: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
-            self.vel_x = angle.cos() * speed;
-            self.vel_y = angle.sin() * speed;
-        }
+                // Mostly stationary: 80% chance of near-zero velocity, 20% gentle drift
+                if self.rng.gen_bool(0.8) {
+                    self.vel_x = 0.0;
+                    self.vel_y = 0.0;
+                } else {
+                    let speed: f64 = self.rng.gen_range(5.0..20.0); // gentle drift
+                    let angle: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
+                    self.vel_x = angle.cos() * speed;
+                    self.vel_y = angle.sin() * speed;
+                }
+            }
     }
 
     // RAII guard to reset the dialog_active flag when the thread exits.
