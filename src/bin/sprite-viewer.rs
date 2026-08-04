@@ -58,11 +58,10 @@ mod linux_impl {
         }
     }
 
-    /// Send a single position update to Hyprland's command socket.  Wayland
-    /// intentionally does not let clients position their own windows, so
-    /// winit's `set_outer_position` is a no-op there.  Hyprland's IPC is the
-    /// compositor-approved path for moving this explicitly floating window.
-    fn move_sprite_with_hyprland(x: f64, y: f64) -> Result<(), String> {
+    /// Send one command to Hyprland's control socket and close it immediately —
+    /// Hyprland processes these synchronously, so holding the connection open
+    /// could stall the compositor.
+    fn hyprland_dispatch(command: &str) -> Result<(), String> {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
             .map_err(|_| "XDG_RUNTIME_DIR is not set".to_string())?;
         let instance = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
@@ -70,19 +69,35 @@ mod linux_impl {
         let socket = format!("{runtime_dir}/hypr/{instance}/.socket.sock");
         let mut stream =
             UnixStream::connect(&socket).map_err(|e| format!("cannot connect to {socket}: {e}"))?;
-        let command = format!(
-            "dispatch movewindowpixel exact {} {},class:^(gremlin-sprite)$",
-            x.round() as i32,
-            y.round() as i32,
-        );
         stream
             .write_all(command.as_bytes())
-            .map_err(|e| format!("cannot send Hyprland move command: {e}"))?;
-        // Hyprland processes this socket synchronously. Close it immediately
-        // instead of retaining a connection that could stall the compositor.
+            .map_err(|e| format!("cannot send Hyprland command: {e}"))?;
         stream
             .shutdown(Shutdown::Both)
             .map_err(|e| format!("cannot close Hyprland IPC socket: {e}"))
+    }
+
+    /// Send a single position update to Hyprland's command socket.  Wayland
+    /// intentionally does not let clients position their own windows, so
+    /// winit's `set_outer_position` is a no-op there.  Hyprland's IPC is the
+    /// compositor-approved path for moving this explicitly floating window.
+    fn move_sprite_with_hyprland(x: f64, y: f64) -> Result<(), String> {
+        hyprland_dispatch(&format!(
+            "dispatch movewindowpixel exact {} {},class:^(gremlin-sprite)$",
+            x.round() as i32,
+            y.round() as i32,
+        ))
+    }
+
+    /// Last-resort geometry fix when the compositor tiled us instead of
+    /// honouring our 192×192 request (i.e. the user's windowrule is missing).
+    /// Floats the window and pins its size so the sprite isn't stretched across
+    /// a whole workspace column.
+    fn force_sprite_geometry_with_hyprland(sz: u32) -> Result<(), String> {
+        const SEL: &str = "class:^(gremlin-sprite)$";
+        hyprland_dispatch(&format!("dispatch setfloating {SEL}"))?;
+        hyprland_dispatch(&format!("dispatch resizewindowpixel exact {sz} {sz},{SEL}"))?;
+        hyprland_dispatch(&format!("dispatch pin {SEL}"))
     }
 
     /// Connect to the Gremlin daemon's Unix socket.
@@ -111,42 +126,18 @@ mod linux_impl {
 
     // ── Daemon protocol ──
 
-    /// Call `sprite_current_frame` directly on the daemon (bypasses LLM).
-    /// Reads the full response by looping until a newline is seen or the
-    /// buffer is exhausted, instead of trusting a single `read()` call to
-    /// return the whole frame — a base64+JSON-wrapped PNG can exceed a
-    /// single fixed-size read, especially over a Unix socket where the
-    /// kernel is free to hand back partial writes in arbitrarily small chunks.
+    /// Call `sprite_current_frame` directly on the daemon (bypasses LLM) and
+    /// decode the base64 PNG it returns.
     pub fn poll_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
         let req = serde_json::json!({"tool":"sprite_current_frame"});
         let mut req_bytes = serde_json::to_vec(&req).ok()?;
         req_bytes.push(b'\n');
         stream.write_all(&req_bytes).ok()?;
 
-        let mut buf = Vec::with_capacity(64 * 1024);
-        let mut chunk = [0u8; 16384];
-        loop {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                // Peer closed the connection mid-response.
-                return None;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.contains(&b'\n') {
-                break;
-            }
-            // Sanity cap: a single sprite frame response should never approach
-            // this size; bail rather than buffer unboundedly on a corrupt stream.
-            if buf.len() > 8 * 1024 * 1024 {
-                return None;
-            }
-        }
-
-        let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
-        let resp: serde_json::Value = serde_json::from_slice(&buf[..line_end]).ok()?;
-        let body = resp["response"].as_str()?;
-
-        let b64 = body.strip_prefix("data:image/png;base64,")?;
+        let resp = read_reply(stream)?;
+        let b64 = resp["response"]
+            .as_str()?
+            .strip_prefix("data:image/png;base64,")?;
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
     }
 
@@ -246,6 +237,29 @@ mod linux_impl {
             .unwrap_or(false)
     }
 
+    /// Read one newline-delimited JSON reply from the daemon. Loops until the
+    /// newline arrives instead of trusting a single `read()` — a long LLM answer
+    /// (or a base64 PNG frame) routinely spans multiple kernel reads.
+    fn read_reply(stream: &mut UnixStream) -> Option<serde_json::Value> {
+        let mut buf = Vec::with_capacity(64 * 1024);
+        let mut chunk = [0u8; 16384];
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None; // peer closed mid-response
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.contains(&b'\n') {
+                break;
+            }
+            if buf.len() > 8 * 1024 * 1024 {
+                return None; // corrupt stream guard
+            }
+        }
+        let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+        serde_json::from_slice(&buf[..end]).ok()
+    }
+
     /// Send a message to the daemon and return the response text.
     fn ask_daemon(daemon_stream: &mut UnixStream, question: &str) -> Option<String> {
         let req = serde_json::json!({"message": question});
@@ -253,9 +267,7 @@ mod linux_impl {
         req_bytes.push(b'\n');
         daemon_stream.write_all(&req_bytes).ok()?;
 
-        let mut buf = [0u8; 65536];
-        let n = daemon_stream.read(&mut buf).ok()?;
-        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).ok()?;
+        let resp = read_reply(daemon_stream)?;
         resp["response"].as_str().map(|s| s.to_string())
     }
 
@@ -584,8 +596,8 @@ mod linux_impl {
     pub struct App {
         window: Option<Arc<Window>>,
         gpu: Option<Gpu>,
-        scale: u32,
         daemon_stream: Arc<Mutex<Option<UnixStream>>>,
+        daemon_connected: bool, // tracked so reconnects log on change, not every retry
         last_frame_rgba: Option<(Vec<u8>, u32, u32)>,
         last_poll: Instant,
         last_reconnect_attempt: Instant,
@@ -615,8 +627,8 @@ mod linux_impl {
             Self {
                 window: None,
                 gpu: None,
-                scale,
                 daemon_stream: Arc::new(Mutex::new(None)),
+                daemon_connected: true, // main() hands us a live stream
                 last_frame_rgba: None,
                 last_poll: Instant::now(),
                 last_reconnect_attempt: Instant::now(),
@@ -648,8 +660,17 @@ mod linux_impl {
             }
 
             let sz = self.display_size;
+            let logical = PhysicalSize::new(sz, sz);
             let attrs = WindowAttributes::default()
-                .with_inner_size(PhysicalSize::new(sz, sz))
+                .with_inner_size(logical)
+                // Pin min == max so a tiling compositor can't stretch us to fill
+                // a workspace column. Without this Hyprland tiles the surface to
+                // the full monitor when its windowrule doesn't match, which is
+                // exactly the "gremlin takes up a whole panel" bug.
+                .with_min_inner_size(logical)
+                .with_max_inner_size(logical)
+                .with_resizable(false)
+                .with_decorations(false)
                 .with_title("gremlin-sprite")
                 .with_name("gremlin-sprite", "gremlin-sprite")
                 .with_visible(true)
@@ -677,10 +698,26 @@ mod linux_impl {
             self.pos_y = (self.screen_h.saturating_sub(sz + 32)) as f64;
             self.randomize_velocity();
 
+            // Report what the compositor ACTUALLY gave us, not what we asked
+            // for — a mismatch here is the tell that the windowrule didn't
+            // match and we got tiled.
             eprintln!(
-                "sprite-viewer: window {}×{} on {}×{}, roaming from ({:.0},{:.0})",
-                sz, sz, self.screen_w, self.screen_h, self.pos_x, self.pos_y
+                "sprite-viewer: requested {sz}×{sz}, got {}×{} on {}×{}, roaming from ({:.0},{:.0})",
+                size.width, size.height, self.screen_w, self.screen_h, self.pos_x, self.pos_y
             );
+            if size.width != sz || size.height != sz {
+                eprintln!(
+                    "sprite-viewer: compositor ignored our size — forcing it via Hyprland IPC. \
+                     Add this to ~/.config/hypr/hyprland.conf to fix it properly:\n  \
+                     windowrule = match:class ^(gremlin-sprite)$, float on, pin on, noborder on, \
+                     noshadow on, nofocus on, noanim on, size {sz} {sz}"
+                );
+                // Self-heal: don't just render wrong because the user's config
+                // is missing a line. Float + resize ourselves over IPC.
+                if let Err(e) = force_sprite_geometry_with_hyprland(sz) {
+                    eprintln!("sprite-viewer: could not self-correct geometry: {e}");
+                }
+            }
             let _ = window.set_outer_position(PhysicalPosition::new(self.pos_x, self.pos_y));
             window.request_redraw();
             self.window = Some(window);
@@ -727,14 +764,22 @@ mod linux_impl {
                         // If the daemon connection died (restarted, socket closed),
                         // drop it and retry a fresh connection every couple of
                         // seconds instead of freezing on the last frame forever.
+                        // Only log on state CHANGE — a persistent failure used to
+                        // print every 2s forever and drown the terminal.
                         if poll_failed
-                            && now.duration_since(self.last_reconnect_attempt) >= Duration::from_secs(2)
+                            && now.duration_since(self.last_reconnect_attempt)
+                                >= Duration::from_secs(2)
                         {
                             self.last_reconnect_attempt = now;
+                            if self.daemon_connected {
+                                eprintln!("sprite-viewer: lost daemon connection, reconnecting...");
+                                self.daemon_connected = false;
+                            }
                             *self.daemon_stream.lock().unwrap() = None;
                             if let Ok(stream) = connect_daemon_once() {
                                 eprintln!("sprite-viewer: reconnected to daemon");
                                 *self.daemon_stream.lock().unwrap() = Some(stream);
+                                self.daemon_connected = true;
                             }
                         }
                     }

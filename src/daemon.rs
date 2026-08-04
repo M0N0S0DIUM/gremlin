@@ -389,59 +389,62 @@ mod unix_daemon {
     ) -> Result<(), GremlinError> {
         let (reader, mut writer) = stream.into_split();
         let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
 
-        // Bound the read with a timeout — a client that connects but never
-        // sends a line (or sends one without a trailing newline) would
-        // otherwise block this connection's task forever. It doesn't block
-        // OTHER clients (each connection gets its own spawned task and the
-        // conversation mutex isn't locked until after this read), but a
-        // leaked task per hung client is still a resource leak worth capping.
-        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
-            Ok(Ok(0)) => return Err(GremlinError::Tool("client disconnected before sending a request".into())),
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => return Err(GremlinError::Tool("client did not send a request within 30s".into())),
-        }
+        // Serve requests until the client disconnects. The sprite viewer holds
+        // ONE connection open and polls `sprite_current_frame` on it at 60 Hz,
+        // so returning after a single request/response (as this used to) closed
+        // the socket out from under it — every poll after the first failed,
+        // which spammed reconnects and made click-to-ask return nothing.
+        loop {
+            let mut line = String::new();
 
-        let request: serde_json::Value = serde_json::from_str(line.trim())?;
+            // Bound each read with a timeout — a client that connects but never
+            // sends a line (or sends one without a trailing newline) would
+            // otherwise block this connection's task forever. Generous enough
+            // that an idle-but-live sprite viewer between polls isn't dropped.
+            const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
+                Ok(Ok(0)) => return Ok(()), // clean client disconnect
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    return Err(GremlinError::Tool(
+                        "client idle for 300s without a request".into(),
+                    ))
+                }
+            }
 
-        // ── Direct tool invocation (bypasses LLM, ~microsecond latency) ──
-        // Used by the sprite viewer and any other performance-critical consumer
-        // that needs raw tool output without going through the LLM loop.
-        if let Some(tool_name) = request["tool"].as_str() {
-            let args = request.get("args").cloned().unwrap_or(serde_json::json!({}));
-            let result = tools.execute(tool_name, args);
-            let reply = serde_json::json!({
-                "response": result.output,
-                "success": result.success
-            });
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue; // keepalive newline — ignore
+            }
+            let request: serde_json::Value = serde_json::from_str(trimmed)?;
+
+            // ── Direct tool invocation (bypasses LLM, ~microsecond latency) ──
+            // Used by the sprite viewer and any other performance-critical
+            // consumer that needs raw tool output without the LLM loop.
+            let reply = if let Some(tool_name) = request["tool"].as_str() {
+                let args = request.get("args").cloned().unwrap_or(serde_json::json!({}));
+                let result = tools.execute(tool_name, args);
+                serde_json::json!({ "response": result.output, "success": result.success })
+            } else {
+                let message = request["message"].as_str().unwrap_or("(empty)").to_string();
+                info!(message = %message, "daemon query");
+
+                // Hold the conversation lock only for this query, not the
+                // whole connection — concurrent clients still serialize on the
+                // LLM but a long query never wedges the frame-polling socket.
+                let mut conv = conversation.lock().await;
+                let response = query(config, ollama, tools, &message, Some(&mut conv)).await?;
+                drop(conv);
+
+                serde_json::json!({ "response": response })
+            };
+
             let mut reply_bytes = serde_json::to_vec(&reply)?;
             reply_bytes.push(b'\n');
             writer.write_all(&reply_bytes).await?;
-            return Ok(());
         }
-
-        let message = request["message"]
-            .as_str()
-            .unwrap_or("(empty)")
-            .to_string();
-
-        info!(message = %message, "daemon query");
-
-        // Lock conversation for the duration of this query
-        let mut conv = conversation.lock().await;
-        let response = query(config, ollama, tools, &message, Some(&mut conv)).await?;
-        drop(conv); // Release lock before writing response
-
-        let reply = serde_json::json!({"response": response});
-        let mut reply_bytes = serde_json::to_vec(&reply)?;
-        reply_bytes.push(b'\n');
-
-        writer.write_all(&reply_bytes).await?;
-
-        Ok(())
     }
 
     pub async fn send(message: &str) -> Result<String, GremlinError> {
